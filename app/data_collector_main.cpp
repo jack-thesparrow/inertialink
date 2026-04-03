@@ -104,7 +104,7 @@ int main(int argc, char *argv[]) {
   }
 
   std::string label = argv[1];
-  std::string baseDir = "../data/" + label;
+  std::string baseDir = "data/" + label;
 
   // Create the directory if it doesn't exist
   if (!fs::exists(baseDir)) {
@@ -112,6 +112,7 @@ int main(int argc, char *argv[]) {
   }
 
   pen::SerialReader imu("/dev/ttyUSB0");
+  // pen::SerialReader imu("/tmp/vtty_laptop");
   if (!imu.isOpen()) {
     std::cerr << "Cannot proceed without hardware connection.\n";
     return -1;
