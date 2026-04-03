@@ -13,7 +13,6 @@ def process_stroke(csv_path):
     """Resamples and normalizes a single stroke CSV."""
     df = pd.read_csv(csv_path)
 
-    # Extract raw data
     raw_pitch = df["pitch"].values
     raw_roll = df["roll"].values
     raw_yaw = df["yaw"].values
@@ -35,60 +34,56 @@ def process_stroke(csv_path):
     return normalized_data
 
 
-def build_dataset(data_dir):
-    all_x_data = []  # Holds the 100x3 arrays
-    all_gt = []  # Holds the labels ('A', 'B', etc.)
-
-    # Find all subdirectories (which act as our labels: 'A', 'B', '1', '2')
+def build_distributed_pickles(data_dir):
+    # Find all subdirectories ('A', 'B', etc.)
     labels = [
         d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))
     ]
 
-    print(f"Found labels: {labels}")
+    print(f"Found folders: {labels}")
 
     for label in labels:
         label_dir = os.path.join(data_dir, label)
-        # Find all CSVs in this folder
         csv_files = glob.glob(os.path.join(label_dir, "*.csv"))
 
-        print(f"Processing {len(csv_files)} samples for letter '{label}'...")
+        if not csv_files:
+            continue
+
+        print(f"\nProcessing {len(csv_files)} samples for letter '{label}'...")
+
+        label_x_data = []
+        label_gt_data = []
 
         for csv_file in csv_files:
             try:
                 processed_array = process_stroke(csv_file)
-                all_x_data.append(processed_array)
-                all_gt.append(label)
+                label_x_data.append(processed_array)
+                label_gt_data.append(label)
             except Exception as e:
                 print(f"Error processing {csv_file}: {e}")
 
-    # Convert to NumPy arrays for efficient ML training
-    X = np.array(all_x_data)
-    Y = np.array(all_gt)
+        # Convert to NumPy arrays
+        X = np.array(label_x_data)
+        Y = np.array(label_gt_data)
 
-    return X, Y
+        # Define paths INSIDE the character folder
+        x_file = os.path.join(label_dir, f"{label}_x_dat.pkl")
+        y_file = os.path.join(label_dir, f"{label}_gt.pkl")
+
+        # Save the pickles
+        with open(x_file, "wb") as f:
+            pickle.dump(X, f)
+        with open(y_file, "wb") as f:
+            pickle.dump(Y, f)
+
+        print(f"  -> Saved {x_file}")
+        print(f"  -> Saved {y_file}")
 
 
 if __name__ == "__main__":
-    # Point this to where your C++ app is saving the folders
-    data_directory = "../data"
+    # Point this to the data folder inside the project root
+    data_directory = "data"
 
-    print("Building Smart Pen Dataset...")
-    X, Y = build_dataset(data_directory)
-
-    print("\n=== Dataset Summary ===")
-    print(f"IMU Data Shape (X): {X.shape}")  # Should be (Samples, 100, 3)
-    print(f"Labels Shape (Y):   {Y.shape}")  # Should be (Samples,)
-
-    # --- SAVE THE EXACT PICKLES THE REPO EXPECTS ---
-    output_dir = "../data"
-
-    x_file = os.path.join(output_dir, "all_x_dat_imu.pkl")
-    with open(x_file, "wb") as f:
-        pickle.dump(X, f)
-
-    y_file = os.path.join(output_dir, "all_gt.pkl")
-    with open(y_file, "wb") as f:
-        pickle.dump(Y, f)
-
-    print(f"\n[SUCCESS] Saved {x_file}")
-    print(f"[SUCCESS] Saved {y_file}")
+    print("Building Modular Smart Pen Dataset...")
+    build_distributed_pickles(data_directory)
+    print("\n[SUCCESS] All characters processed into their respective folders.")
