@@ -5,6 +5,7 @@
 *.o
 *.ko
 *.obj
+*.out
 *.elf
 
 # Linker output
@@ -53,3 +54,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# binary folders
+bin/
+build/
+
+# generic binary/executables
+/inertialink
+*.out
