@@ -20,6 +20,52 @@ struct DataPoint {
 };
 
 // ---------------------------------------------------------
+// DATA FILTERING & ZERO-ANCHORING
+// ---------------------------------------------------------
+struct EMAFilter {
+  float alpha = 0.15f; // Tune this: 0.1 is smooth, 0.9 is raw
+  float filteredPitch = 0.0f;
+  float filteredRoll = 0.0f;
+  float filteredYaw = 0.0f;
+  bool isFirstFrame = true;
+
+  float startPitch = 0.0f;
+  float startRoll = 0.0f;
+  float startYaw = 0.0f;
+
+  void process(pen::IMUData &rawData) {
+    if (isFirstFrame) {
+      // Zero-Anchoring: Capture the starting orientation
+      startPitch = rawData.pitch;
+      startRoll = rawData.roll;
+      startYaw = rawData.yaw;
+
+      filteredPitch = 0.0f;
+      filteredRoll = 0.0f;
+      filteredYaw = 0.0f;
+      isFirstFrame = false;
+    }
+
+    // Subtract the anchor to make the stroke relative to (0,0,0)
+    float relativePitch = rawData.pitch - startPitch;
+    float relativeRoll = rawData.roll - startRoll;
+    float relativeYaw = rawData.yaw - startYaw;
+
+    // Apply the Exponential Moving Average (EMA) Low-Pass Filter
+    filteredPitch = (alpha * relativePitch) + ((1.0f - alpha) * filteredPitch);
+    filteredRoll = (alpha * relativeRoll) + ((1.0f - alpha) * filteredRoll);
+    filteredYaw = (alpha * relativeYaw) + ((1.0f - alpha) * filteredYaw);
+
+    // Overwrite the raw data with the clean data
+    rawData.pitch = filteredPitch;
+    rawData.roll = filteredRoll;
+    rawData.yaw = filteredYaw;
+  }
+
+  void reset() { isFirstFrame = true; }
+};
+
+// ---------------------------------------------------------
 // LINUX TERMINAL MAGIC: Non-blocking keyboard reads
 // ---------------------------------------------------------
 bool isSpacebarPressed() {
@@ -73,8 +119,9 @@ int main(int argc, char *argv[]) {
 
   int sampleCount = 1;
   std::vector<DataPoint> strokeBuffer;
-  // Pre-allocate memory to avoid reallocation stutters during recording
   strokeBuffer.reserve(1000);
+
+  EMAFilter strokeFilter;
 
   std::cout << "\n=== Smart Pen Data Collector ===\n";
   std::cout << "Target Character: '" << label << "'\n";
@@ -96,6 +143,8 @@ int main(int argc, char *argv[]) {
     std::cout.flush();
 
     strokeBuffer.clear();
+    strokeFilter.reset(); // CRITICAL: Reset the zero-anchor for the new stroke
+
     pen::IMUData currentData;
     auto startTime = std::chrono::steady_clock::now();
 
@@ -107,8 +156,12 @@ int main(int argc, char *argv[]) {
         break;
       }
 
-      // If we have a fresh IMU packet, save it to RAM
+      // If we have a fresh IMU packet, process it and save it to RAM
       if (imu.readData(currentData)) {
+
+        // --- PASS RAW DATA THROUGH OUR FILTER ---
+        strokeFilter.process(currentData);
+
         auto now = std::chrono::steady_clock::now();
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                              now - startTime)
