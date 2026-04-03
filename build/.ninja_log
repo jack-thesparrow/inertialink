@@ -1,0 +1,27 @@
+# ninja log v5
+8	68	1775240497310068863	_deps/glfw-build/src/CMakeFiles/glfw.dir/posix_time.c.o	3135c81e941b0d9e
+6	84	1775240497324068705	_deps/glfw-build/src/CMakeFiles/glfw.dir/vulkan.c.o	af959e426189c91b
+9	90	1775240497332068614	_deps/glfw-build/src/CMakeFiles/glfw.dir/posix_thread.c.o	8d17146a73401238
+8	94	1775240497336068569	_deps/glfw-build/src/CMakeFiles/glfw.dir/xkb_unicode.c.o	c2a47899844473c5
+5	98	1775240497334068592	_deps/glfw-build/src/CMakeFiles/glfw.dir/init.c.o	d329fab7d02fa77a
+11	104	1775240497346068456	_deps/glfw-build/src/CMakeFiles/glfw.dir/glx_context.c.o	9773e3a0ea29e434
+5	124	1775240497360068298	_deps/glfw-build/src/CMakeFiles/glfw.dir/monitor.c.o	844703b97d7c3cdf
+4	130	1775240497365068241	_deps/glfw-build/src/CMakeFiles/glfw.dir/context.c.o	ca4cf70a4b541550
+7	132	1775240497373068151	_deps/glfw-build/src/CMakeFiles/glfw.dir/x11_monitor.c.o	5ebb5c3d4fce7437
+6	133	1775240497375068129	_deps/glfw-build/src/CMakeFiles/glfw.dir/window.c.o	926a396ddb66a761
+4	137	1775240497379068083	third_party/CMakeFiles/glad.dir/glad/src/glad.c.o	e9dd2a72d54b78e8
+7	146	1775240497387067993	_deps/glfw-build/src/CMakeFiles/glfw.dir/x11_init.c.o	bd64eb194428ac97
+84	164	1775240497406067778	_deps/glfw-build/src/CMakeFiles/glfw.dir/osmesa_context.c.o	ada59801a7512d2
+5	170	1775240497412067711	_deps/glfw-build/src/CMakeFiles/glfw.dir/input.c.o	54705e2caafee3e8
+137	170	1775240497411067722	/home/rahul/.projects/inertialink/lib/libglad.a	c950ffb57e6f1b4e
+69	175	1775240497417067654	_deps/glfw-build/src/CMakeFiles/glfw.dir/egl_context.c.o	b9181a1b1cb46d5e
+91	185	1775240497427067541	_deps/glfw-build/src/CMakeFiles/glfw.dir/linux_joystick.c.o	57bcd74310ff114d
+7	213	1775240497455067225	_deps/glfw-build/src/CMakeFiles/glfw.dir/x11_window.c.o	3ac619ad051928a7
+213	248	1775240497489066841	/home/rahul/.projects/inertialink/lib/libglfw3.a	ff4fce1ef30732ef
+104	257	1775240497499066728	app/CMakeFiles/visualizer.dir/visualizer_main.cpp.o	feb8440bdd4baef3
+124	350	1775240497591065688	app/CMakeFiles/decoder.dir/decoder_main.cpp.o	e3d822251944c513
+95	354	1775240497596065632	src/CMakeFiles/PenCore.dir/io.cpp.o	d5bcc47e58021aeb
+99	499	1775240497741063994	src/CMakeFiles/PenCore.dir/viz.cpp.o	bc1fa330b497f797
+500	527	1775240497768063689	/home/rahul/.projects/inertialink/lib/libPenCore.a	7952bb71e319b88f
+527	575	1775240497816063146	/home/rahul/.projects/inertialink/bin/decoder	820c6d0ec23a874c
+527	588	1775240497829063000	/home/rahul/.projects/inertialink/bin/visualizer	cf32a052caa84e1f
