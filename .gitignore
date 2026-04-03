@@ -1,49 +1,42 @@
-# Prerequisites
+# --- C/C++ Prerequisites & Objects ---
 *.d
-
-# Object files
 *.o
 *.ko
 *.obj
 *.out
 *.elf
-
-# Linker output
 *.ilk
 *.map
 *.exp
-
-# Precompiled Headers
 *.gch
 *.pch
 
-# Libraries
+# --- Libraries & Shared Objects ---
 *.lib
 *.a
 *.la
 *.lo
-
-# Shared objects (inc. Windows DLLs)
 *.dll
 *.so
 *.so.*
 *.dylib
 
-# Executables
+# --- Executables & Binaries ---
 *.exe
-*.out
 *.app
 *.i*86
 *.x86_64
 *.hex
+bin/
+build/
+.cache/
+/inertialink
 
-# Debug files
+# --- Debug & Compile Info ---
 *.dSYM/
 *.su
 *.idb
 *.pdb
-
-# Kernel Module Compile Results
 *.mod*
 *.cmd
 .tmp_versions/
@@ -51,18 +44,31 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
-
-# debug information files
 *.dwo
 
-# binary folders
-bin/
-build/
-
-# generic binary/executables
-/inertialink
-*.out
-
-# cmake files
+# --- CMake ---
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
 compile_commands.json
-.cache/
+
+# --- PlatformIO ---
+.pio/
+esp32_firmware/.pio/
+
+# --- Python & Machine Learning ---
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore our generated ML datasets (CSVs and Pickles)
+data/
+*.pkl
+*.csv
+
+# --- OS & Editor Junk ---
+.DS_Store
+*.swp
+.vscode/
+.idea/
