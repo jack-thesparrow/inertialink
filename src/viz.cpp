@@ -1,6 +1,6 @@
 #include "pen/viz.hpp"
 #include <glad/glad.h>
-//
+// glad before GLFW
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -9,6 +9,7 @@
 
 namespace pen {
 
+// --- CUBE SHADERS ---
 const char *vertexShaderSource = R"(
 #version 330 core
 layout (location = 0) in vec3 aPos;
@@ -27,6 +28,24 @@ in vec3 vertexColor;
 out vec4 FragColor;
 void main() {
     FragColor = vec4(vertexColor, 1.0);
+}
+)";
+
+// --- TRAIL SHADERS (Neon Orange) ---
+const char *trailVertexShader = R"(
+#version 330 core
+layout (location = 0) in vec3 aPos;
+uniform mat4 MVP;
+void main() {
+    gl_Position = MVP * vec4(aPos, 1.0);
+}
+)";
+
+const char *trailFragmentShader = R"(
+#version 330 core
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(1.0, 0.6, 0.1, 1.0); // Bright Neon Orange
 }
 )";
 
@@ -65,6 +84,10 @@ void Visualizer::update() {
   glfwPollEvents();
   if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
     glfwSetWindowShouldClose(window, true);
+
+  // Press 'C' to clear the canvas!
+  if (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS)
+    strokeTrail.clear();
 }
 
 void Visualizer::initOpenGL() {
@@ -74,6 +97,8 @@ void Visualizer::initOpenGL() {
     glCompileShader(shader);
     return shader;
   };
+
+  // Compile Cube Shader
   unsigned int vs = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
   unsigned int fs = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
   shaderProgram = glCreateProgram();
@@ -82,9 +107,20 @@ void Visualizer::initOpenGL() {
   glLinkProgram(shaderProgram);
   glDeleteShader(vs);
   glDeleteShader(fs);
+
+  // Compile Trail Shader
+  unsigned int tvs = compileShader(GL_VERTEX_SHADER, trailVertexShader);
+  unsigned int tfs = compileShader(GL_FRAGMENT_SHADER, trailFragmentShader);
+  trailShaderProgram = glCreateProgram();
+  glAttachShader(trailShaderProgram, tvs);
+  glAttachShader(trailShaderProgram, tfs);
+  glLinkProgram(trailShaderProgram);
+  glDeleteShader(tvs);
+  glDeleteShader(tfs);
 }
 
 void Visualizer::setupGeometry() {
+  // --- Cube Geometry Setup ---
   float vertices[] = {
       -0.25f, -0.25f, 0.25f,  0.0f,   0.0f,   1.0f,   0.25f,  -0.25f, 0.25f,
       0.0f,   1.0f,   1.0f,   0.25f,  0.25f,  0.25f,  0.0f,   1.0f,   1.0f,
@@ -137,35 +173,90 @@ void Visualizer::setupGeometry() {
   glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
                         (void *)(3 * sizeof(float)));
   glEnableVertexAttribArray(1);
+
+  // --- Trail Geometry Setup ---
+  glGenVertexArrays(1, &trailVAO);
+  glGenBuffers(1, &trailVBO);
+  glBindVertexArray(trailVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void *)0);
+  glEnableVertexAttribArray(0);
 }
 
 void Visualizer::drawCube(const IMUData &imu) {
   int width, height;
   glfwGetFramebufferSize(window, &width, &height);
-  glViewport(0, 0, width, height);
+  int halfWidth = width / 2;
 
+  // Clear the ENTIRE window once
+  glViewport(0, 0, width, height);
   glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-  glm::mat4 model = glm::mat4(1.0f);
-  model = glm::rotate(model, imu.yaw, glm::vec3(0.0f, 1.0f, 0.0f));
-  model = glm::rotate(model, imu.pitch, glm::vec3(1.0f, 0.0f, 0.0f));
-  model = glm::rotate(model, imu.roll, glm::vec3(0.0f, 0.0f, 1.0f));
-
+  // Both sides will share this camera setup, adjusted for the half-screen
+  // aspect ratio
   glm::mat4 view =
-      glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -2.0f));
+      glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.0f));
   glm::mat4 projection = glm::perspective(
-      glm::radians(45.0f), (float)width / (float)height, 0.1f, 100.0f);
-  glm::mat4 mvp = projection * view * model;
+      glm::radians(45.0f), (float)halfWidth / (float)height, 0.1f, 100.0f);
+
+  // ==========================================
+  // LEFT VIEWPORT: 3D Spinning Cube
+  // ==========================================
+  glViewport(0, 0, halfWidth,
+             height); // Tell OpenGL to only draw on the left half
+
+  glm::mat4 cubeModel = glm::mat4(1.0f);
+  // The cube stays centered and just spins to show orientation
+  cubeModel = glm::rotate(cubeModel, imu.yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+  cubeModel = glm::rotate(cubeModel, imu.pitch, glm::vec3(1.0f, 0.0f, 0.0f));
+  cubeModel = glm::rotate(cubeModel, imu.roll, glm::vec3(0.0f, 0.0f, 1.0f));
+
+  glm::mat4 cubeMVP = projection * view * cubeModel;
 
   glUseProgram(shaderProgram);
   glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "MVP"), 1, GL_FALSE,
-                     glm::value_ptr(mvp));
+                     glm::value_ptr(cubeMVP));
 
   glBindVertexArray(faceVAO);
   glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
+
   glBindVertexArray(edgeVAO);
   glLineWidth(2.0f);
   glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, 0);
+
+  // ==========================================
+  // RIGHT VIEWPORT: 2D Stroke Canvas
+  // ==========================================
+  glViewport(halfWidth, 0, halfWidth,
+             height); // Tell OpenGL to only draw on the right half
+
+  // Calculate the 2D coordinate directly from pitch and yaw
+  float canvasScale = 4.0f;
+  glm::vec3 newPoint(-imu.yaw * canvasScale, imu.pitch * canvasScale, 0.0f);
+
+  // Add the point to our stroke trail
+  if (strokeTrail.empty() ||
+      glm::length(strokeTrail.back() - newPoint) > 0.005f) {
+    strokeTrail.push_back(newPoint);
+    if (strokeTrail.size() > 2000)
+      strokeTrail.erase(strokeTrail.begin());
+  }
+
+  glm::mat4 trailModel = glm::mat4(1.0f); // Trail stays static on the canvas
+  glm::mat4 trailMVP = projection * view * trailModel;
+
+  glUseProgram(trailShaderProgram);
+  glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"), 1,
+                     GL_FALSE, glm::value_ptr(trailMVP));
+
+  glBindVertexArray(trailVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
+  glBufferData(GL_ARRAY_BUFFER, strokeTrail.size() * sizeof(glm::vec3),
+               strokeTrail.data(), GL_DYNAMIC_DRAW);
+
+  glLineWidth(4.0f);
+  glDrawArrays(GL_LINE_STRIP, 0, strokeTrail.size());
 }
+
 } // namespace pen
