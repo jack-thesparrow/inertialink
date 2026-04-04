@@ -1,185 +1,175 @@
+# scripts / train_bilstm.py
 import os
 import glob
-import pickle
-import time
-import logging
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.utils.rnn import pad_sequence
+import pandas as pd
 import numpy as np
 
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from keras.models import Model
-from keras.layers import (
-    Conv1D,
-    Input,
-    Dense,
-    Dropout,
-    Bidirectional,
-    LSTM,
-    GlobalAveragePooling1D,
-)
-from keras.utils import to_categorical
-from tabulate import tabulate
+# ---------------------------------------------------------
+# 1. ALPHABET & HYPERPARAMETERS
+# ---------------------------------------------------------
+# Index 0 is strictly reserved for the CTC "Blank" token.
+# We include lowercase, uppercase, numbers, and space.
+ALPHABET = "<BLANK> abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+CHAR_TO_IDX = {char: idx for idx, char in enumerate(ALPHABET)}
+IDX_TO_CHAR = {idx: char for idx, char in enumerate(ALPHABET)}
 
-# --- CONFIGURATION ---
-DATA_DIR = "data"
-MODEL_FILE = "data/smart_pen_bilstm.keras"
-TARGET_SEQUENCE_LENGTH = 100
-FEATURES = 3  # Pitch, Roll, Yaw
-NUM_EPOCHS = 50
-BATCH_SIZE = 32
-DISPLAY_ALL_RESULTS = False
-
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+INPUT_FEATURES = 3  # (x, y, accel_z)
+HIDDEN_SIZE = 128  # Brain capacity
+NUM_LAYERS = 2  # Stacked LSTMs
+NUM_CLASSES = len(ALPHABET)
 
 
-def log_message(message: str) -> None:
-    logging.info(message)
-
-
-def load_modular_dataset(data_dir):
-    """Crawls the data directory and loads all individual character pickles."""
-    X_list, Y_list = [], []
-    x_files = glob.glob(os.path.join(data_dir, "*", "*_x_dat.pkl"))
-
-    if not x_files:
-        raise ValueError(
-            f"No pickle files found in {data_dir}. Run build_pickles.py first!"
+# ---------------------------------------------------------
+# 2. NEURAL NETWORK ARCHITECTURE
+# ---------------------------------------------------------
+class SmartPenDecoder(nn.Module):
+    def __init__(self):
+        super(SmartPenDecoder, self).__init__()
+        self.lstm = nn.LSTM(
+            input_size=INPUT_FEATURES,
+            hidden_size=HIDDEN_SIZE,
+            num_layers=NUM_LAYERS,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2,
         )
+        # Bi-LSTM outputs 2x hidden size
+        self.fc = nn.Linear(HIDDEN_SIZE * 2, NUM_CLASSES)
 
-    for x_file in x_files:
-        y_file = x_file.replace("_x_dat.pkl", "_gt.pkl")
-        with open(x_file, "rb") as f:
-            X_list.append(pickle.load(f))
-        with open(y_file, "rb") as f:
-            Y_list.append(pickle.load(f))
-
-    return np.concatenate(X_list, axis=0), np.concatenate(Y_list, axis=0)
+    def forward(self, x):
+        # x shape: (Batch, Seq_Len, Features)
+        lstm_out, _ = self.lstm(x)
+        logits = self.fc(lstm_out)
+        # logits shape: (Batch, Seq_Len, Num_Classes)
+        return logits
 
 
-# --- 1. DATA LOADING & PREPROCESSING ---
-start_time = time.time()
-log_message("Loading modular IMU data...")
-imu_data_padded, gt_data_raw = load_modular_dataset(DATA_DIR)
+# ---------------------------------------------------------
+# 3. DATA LOADING
+# ---------------------------------------------------------
+def load_dataset(data_dir="data"):
+    """Reads all CSVs exported by the C++ Autonomous Collector"""
+    sequences = []
+    targets = []
 
-# Convert string labels ('A', 'B') to categorical integers
-label_encoder = LabelEncoder()
-gt_data_integers = label_encoder.fit_transform(gt_data_raw)
-num_classes = len(label_encoder.classes_)
-gt_data_categorical = to_categorical(gt_data_integers, num_classes=num_classes)
+    if not os.path.exists(data_dir):
+        print(f"[Error] Directory '{data_dir}' not found! Collect data via C++ first.")
+        return sequences, targets
 
-# --- 2. DEDUPLICATION ---
-log_message("Removing duplicates from dataset...")
-unique_indices = []
-seen_hashes = set()
+    for label_folder in os.listdir(data_dir):
+        folder_path = os.path.join(data_dir, label_folder)
+        if not os.path.isdir(folder_path):
+            continue
 
-for i in range(len(imu_data_padded)):
-    sample_hash = imu_data_padded[i].tobytes()
-    if sample_hash not in seen_hashes:
-        seen_hashes.add(sample_hash)
-        unique_indices.append(i)
+        for csv_file in glob.glob(f"{folder_path}/*.csv"):
+            df = pd.read_csv(csv_file)
 
-imu_data_padded = imu_data_padded[unique_indices]
-gt_data_categorical = gt_data_categorical[unique_indices]
-gt_data_integers = gt_data_integers[unique_indices]
+            # Extract the 3 physical features (Skip timestamp)
+            tensor_data = torch.tensor(
+                df[["x", "y", "accel_z"]].values, dtype=torch.float32
+            )
 
-log_message(f"Remaining unique samples: {len(imu_data_padded)}")
+            # Convert the folder name (e.g., "Hello123") into target IDs
+            target_ids = [
+                CHAR_TO_IDX[char] for char in label_folder if char in CHAR_TO_IDX
+            ]
 
-# --- 3. TRAIN / TEST SPLIT ---
-log_message("Splitting data into Training (80%) and Test (20%)...")
-X_train, X_test, y_class_train, y_class_test = train_test_split(
-    imu_data_padded,
-    gt_data_categorical,
-    test_size=0.2,
-    random_state=42,
-    stratify=gt_data_integers,
-)
+            sequences.append(tensor_data)
+            targets.append(torch.tensor(target_ids, dtype=torch.long))
 
-# Autoencoder targets are exactly identical to the inputs
-y_ae_train = X_train
-y_ae_test = X_test
+    return sequences, targets
 
-# --- 4. MODEL ARCHITECTURE (CNN + Bi-LSTM) ---
-log_message("Building CNN + Bi-LSTM architecture...")
 
-input_layer = Input(shape=(TARGET_SEQUENCE_LENGTH, FEATURES))
+# ---------------------------------------------------------
+# 4. TRAINING LOOP
+# ---------------------------------------------------------
+def train_and_export():
+    print("=== Smart Pen CTC Trainer ===")
+    X_train, Y_train = load_dataset()
 
-# CNN Extractor (Padding 'same' keeps our 100 frames intact)
-x = Conv1D(filters=64, kernel_size=3, activation="relu", padding="same")(input_layer)
-x = Conv1D(filters=128, kernel_size=3, activation="relu", padding="same")(x)
-x = Dropout(0.3)(x)
+    if len(X_train) == 0:
+        return
 
-# Bidirectional LSTM for temporal sequence memory
-x = Bidirectional(LSTM(128, return_sequences=True))(x)
+    print(f"Loaded {len(X_train)} stroke samples.")
 
-# Head 1: Classification (What letter is this?)
-y_class = GlobalAveragePooling1D()(x)
-classification_output = Dense(num_classes, activation="softmax", name="classification")(
-    y_class
-)
+    model = SmartPenDecoder()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# Head 2: Autoencoder (Reconstruct the Pitch, Roll, Yaw to ensure rich feature learning)
-autoencoder_output = Dense(FEATURES, activation="linear", name="autoencoder")(x)
+    # CTC Loss is the magic that allows continuous variable-length reading
+    ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
 
-mtl_model = Model(
-    inputs=input_layer, outputs=[classification_output, autoencoder_output]
-)
+    model.train()
+    epochs = 50
 
-mtl_model.compile(
-    optimizer="adam",
-    loss={"classification": "categorical_crossentropy", "autoencoder": "mse"},
-    loss_weights={
-        "classification": 1.0,
-        "autoencoder": 0.5,  # Give slightly less priority to reconstruction vs prediction
-    },
-    metrics={"classification": ["accuracy"]},
-)
+    for epoch in range(epochs):
+        total_loss = 0
 
-mtl_model.summary()
+        # Training one sample at a time handles variable lengths gracefully
+        for x, y in zip(X_train, Y_train):
+            optimizer.zero_grad()
 
-# --- 5. TRAINING ---
-log_message("\nStarting model training...")
-mtl_model.fit(
-    X_train,
-    [y_class_train, y_ae_train],
-    validation_data=(X_test, [y_class_test, y_ae_test]),
-    epochs=NUM_EPOCHS,
-    batch_size=BATCH_SIZE,
-    verbose=1,
-)
+            # Add Batch Dimension: (Seq_Len, 3) -> (1, Seq_Len, 3)
+            x_batched = x.unsqueeze(0)
+            logits = model(x_batched)
 
-mtl_model.save(MODEL_FILE)
+            # CTC Loss expects: (Seq_Len, Batch, Num_Classes)
+            logits_ctc = logits.transpose(0, 1)
 
-# Save Class Map for C++ inference later
-with open(MODEL_FILE.replace(".keras", "_classes.pkl"), "wb") as f:
-    pickle.dump(label_encoder.classes_, f)
-log_message(f"Model and Class Map saved successfully.")
+            input_lengths = torch.tensor([logits_ctc.size(0)], dtype=torch.long)
+            target_lengths = torch.tensor([y.size(0)], dtype=torch.long)
 
-# --- 6. EVALUATION ---
-log_message("\nEvaluating model...")
-predicted_labels, _ = mtl_model.predict(X_test)
-predicted_chars = label_encoder.inverse_transform(np.argmax(predicted_labels, axis=1))
-ground_truth_chars = label_encoder.inverse_transform(np.argmax(y_class_test, axis=1))
+            loss = ctc_loss(logits_ctc.log_softmax(2), y, input_lengths, target_lengths)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-evaluation = mtl_model.evaluate(
-    X_test, [y_class_test, y_ae_test], verbose=0, return_dict=True
-)
-classification_accuracy = evaluation.get("classification_accuracy", 0.0)
+        if (epoch + 1) % 5 == 0:
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(X_train):.4f}")
 
-mismatched_data = []
-for i in range(len(predicted_chars)):
-    if predicted_chars[i] != ground_truth_chars[i]:
-        mismatched_data.append([i + 1, predicted_chars[i], ground_truth_chars[i]])
+    # ---------------------------------------------------------
+    # 5. ONNX EXPORT FOR C++
+    # ---------------------------------------------------------
+    import warnings
+    import onnx
+    from torch.export import Dim
 
-log_message(f"\nClassification Accuracy: {classification_accuracy * 100:.2f}%")
+    warnings.filterwarnings("ignore")
+    os.makedirs("models", exist_ok=True)
+    onnx_path = "models/pen_model.onnx"
 
-if mismatched_data:
-    log_message("\nMismatched Characters:")
-    log_message(
-        tabulate(
-            mismatched_data,
-            headers=["Sample #", "Predicted", "Actual"],
-            tablefmt="grid",
-        )
+    model.eval()
+    dummy_input = torch.randn(1, 150, INPUT_FEATURES)
+
+    # Define dynamic shapes
+    seq_len_dim = Dim("seq_len", min=1, max=10000)
+    dynamic_shapes = {"x": {1: seq_len_dim}}
+
+    torch.onnx.export(
+        model,
+        (dummy_input,),
+        onnx_path,
+        export_params=True,
+        opset_version=17,
+        do_constant_folding=True,
+        input_names=["input_stroke"],
+        output_names=["predicted_logits"],
+        dynamic_shapes=dynamic_shapes,
     )
-else:
-    log_message("\nPerfect Accuracy! No mismatched characters found.")
+
+    # --- THE MAGIC FIX FOR C++ ---
+    # PyTorch's exporter is too modern for your C++ system library.
+    # We will manually downgrade the internal file version so C++ can read it.
+    onnx_model = onnx.load(onnx_path)
+    onnx_model.ir_version = 9
+    onnx.save(onnx_model, onnx_path)
+
+    print(f"\n[SUCCESS] AI Brain exported to: {onnx_path} (IR Version 9)")
+    print("The C++ decoder is now ready to receive this brain.")
+
+
+if __name__ == "__main__":
+    train_and_export()
