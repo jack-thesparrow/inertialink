@@ -22,3 +22,35 @@ FetchContent_MakeAvailable(glm)
 # --- GLAD SETUP ---
 add_library(glad STATIC glad/src/glad.c)
 target_include_directories(glad PUBLIC glad/include)
+
+# --- ONNX Runtime डाउनलोड ---
+FetchContent_Declare(
+    onnxruntime
+    URL https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+
+FetchContent_MakeAvailable(onnxruntime)
+
+# --- Auto-detect extracted directory ---
+file(GLOB ONNX_DIRS LIST_DIRECTORIES true "${onnxruntime_SOURCE_DIR}/*")
+
+# Filter only directories that look like onnxruntime-*
+set(ONNX_ROOT "")
+foreach(dir ${ONNX_DIRS})
+    if(IS_DIRECTORY "${dir}" AND dir MATCHES "onnxruntime-")
+        set(ONNX_ROOT "${dir}")
+    endif()
+endforeach()
+
+if(NOT ONNX_ROOT)
+    message(FATAL_ERROR "Could not find extracted ONNX Runtime directory")
+endif()
+
+# --- Imported target ---
+add_library(ONNXRuntime SHARED IMPORTED)
+
+set_target_properties(ONNXRuntime PROPERTIES
+    IMPORTED_LOCATION "${ONNX_ROOT}/lib/libonnxruntime.so"
+    INTERFACE_INCLUDE_DIRECTORIES "${ONNX_ROOT}/include"
+)
