@@ -8,6 +8,7 @@ struct IMUData {
   float pitch = 0.0f;
   float roll = 0.0f;
   float yaw = 0.0f;
+  float accel_z = 0.0f; // NEW: The shockwave sensor for pen-lift!
 };
 
 // --- SIGNAL PROCESSING: LOW-PASS FILTER ---

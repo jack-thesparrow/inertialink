@@ -35,6 +35,10 @@ IMUData IMUFilter::process(const IMUData &raw) {
   filtered.roll = (alpha * raw.roll) + ((1.0f - alpha) * previous.roll);
   filtered.yaw = (alpha * raw.yaw) + ((1.0f - alpha) * previous.yaw);
 
+  // NEVER filter the accelerometer! We want the raw, sharp impact spikes for
+  // the ML model.
+  filtered.accel_z = raw.accel_z;
+
   previous = filtered;
   return filtered;
 }
@@ -76,11 +80,14 @@ bool SerialReader::readData(IMUData &data) {
   while (read(fd, &c, 1) > 0) {
     if (c == '\n') {
       buffer[bufPos] = '\0';
-      float p, r, y;
-      if (sscanf(buffer, "%f,%f,%f", &p, &r, &y) == 3) {
+      // Look for 4 values, but accept 3 so the simulator doesn't crash
+      float p, r, y, az = 0.0f;
+      int parsed = sscanf(buffer, "%f,%f,%f,%f", &p, &r, &y, &az);
+      if (parsed >= 3) {
         data.pitch = p * (M_PI / 180.0f);
         data.roll = r * (M_PI / 180.0f);
         data.yaw = y * (M_PI / 180.0f);
+        data.accel_z = az; // Captures Z-axis gravity/impact
         newDataReady = true;
       }
       bufPos = 0;
@@ -128,11 +135,13 @@ bool UDPReader::readData(IMUData &data) {
   int n = recvfrom(sockfd, (char *)buf, 1024, MSG_DONTWAIT, NULL, NULL);
   if (n > 0) {
     buf[n] = '\0';
-    float p, r, y;
-    if (sscanf(buf, "%f,%f,%f", &p, &r, &y) == 3) {
+    float p, r, y, az = 0.0f;
+    int parsed = sscanf(buf, "%f,%f,%f,%f", &p, &r, &y, &az);
+    if (parsed >= 3) {
       data.pitch = p * (M_PI / 180.0f);
       data.roll = r * (M_PI / 180.0f);
       data.yaw = y * (M_PI / 180.0f);
+      data.accel_z = az;
       return true;
     }
   }
