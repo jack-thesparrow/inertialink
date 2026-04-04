@@ -1,194 +1,207 @@
 #include "pen/io.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <fcntl.h>
 #include <iostream>
 #include <onnxruntime_cxx_api.h>
-#include <termios.h>
-#include <unistd.h>
+#include <string>
 #include <vector>
 
-// ---------------------------------------------------------
-// HELPER STRUCTS
-// ---------------------------------------------------------
+// ML Input Format
 struct DataPoint {
-  float pitch, roll, yaw;
+  float x;
+  float y;
+  float accel_z;
 };
 
-struct EMAFilter {
-  float alpha = 0.15f;
-  float fPitch = 0.0f, fRoll = 0.0f, fYaw = 0.0f;
-  float sPitch = 0.0f, sRoll = 0.0f, sYaw = 0.0f;
-  bool isFirstFrame = true;
+// The exact alphabet from our PyTorch script! Index 0 is <BLANK>
+const std::string ALPHABET =
+    "<BLANK> abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-  void process(pen::IMUData &raw) {
-    if (isFirstFrame) {
-      sPitch = raw.pitch;
-      sRoll = raw.roll;
-      sYaw = raw.yaw;
-      fPitch = 0;
-      fRoll = 0;
-      fYaw = 0;
-      isFirstFrame = false;
-    }
-    fPitch = (alpha * (raw.pitch - sPitch)) + ((1.0f - alpha) * fPitch);
-    fRoll = (alpha * (raw.roll - sRoll)) + ((1.0f - alpha) * fRoll);
-    fYaw = (alpha * (raw.yaw - sYaw)) + ((1.0f - alpha) * fYaw);
+// ---------------------------------------------------------
+// ONNX INFERENCE & CTC DECODER
+// ---------------------------------------------------------
+void runAIInference(Ort::Session &session,
+                    const std::vector<DataPoint> &strokeBuffer) {
+  if (strokeBuffer.empty())
+    return;
 
-    raw.pitch = fPitch;
-    raw.roll = fRoll;
-    raw.yaw = fYaw;
+  // 1. Flatten our structured data into a raw 1D float array for the Neural
+  // Network The AI expects shape: [1 (batch), Sequence_Length, 3 (features)]
+  std::vector<float> input_tensor_values;
+  input_tensor_values.reserve(strokeBuffer.size() * 3);
+  for (const auto &pt : strokeBuffer) {
+    input_tensor_values.push_back(pt.x);
+    input_tensor_values.push_back(pt.y);
+    input_tensor_values.push_back(pt.accel_z);
   }
-  void reset() { isFirstFrame = true; }
-};
 
-// Linux Terminal non-blocking keypress
-bool isSpacebarPressed() {
-  struct termios oldt, newt;
-  int ch;
-  int oldf;
-  tcgetattr(STDIN_FILENO, &oldt);
-  newt = oldt;
-  newt.c_lflag &= ~(ICANON | ECHO);
-  tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-  oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
-  fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
-  ch = getchar();
-  tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-  fcntl(STDIN_FILENO, F_SETFL, oldf);
-  if (ch != EOF) {
-    ungetc(ch, stdin);
-    return (ch == ' ');
-  }
-  return false;
-}
-
-// ---------------------------------------------------------
-// C++ 1D INTERPOLATION (Stretches/Squishes stroke to 100 frames)
-// ---------------------------------------------------------
-std::vector<float> resampleStroke(const std::vector<DataPoint> &raw_stroke,
-                                  int target_len = 100) {
-  std::vector<float> flat_tensor(target_len * 3, 0.0f);
-  if (raw_stroke.empty())
-    return flat_tensor;
-
-  int n = raw_stroke.size();
-  for (int i = 0; i < target_len; ++i) {
-    // Find where this point maps onto the original array
-    float original_idx = (float)i * (n - 1) / (target_len - 1);
-    int idx1 = std::floor(original_idx);
-    int idx2 = std::min((int)std::ceil(original_idx), n - 1);
-    float weight = original_idx - idx1;
-
-    // Linear interpolation for Pitch, Roll, Yaw
-    float p = raw_stroke[idx1].pitch +
-              weight * (raw_stroke[idx2].pitch - raw_stroke[idx1].pitch);
-    float r = raw_stroke[idx1].roll +
-              weight * (raw_stroke[idx2].roll - raw_stroke[idx1].roll);
-    float y = raw_stroke[idx1].yaw +
-              weight * (raw_stroke[idx2].yaw - raw_stroke[idx1].yaw);
-
-    // Flatten into [100 * 3] 1D array for ONNX
-    flat_tensor[(i * 3) + 0] = p;
-    flat_tensor[(i * 3) + 1] = r;
-    flat_tensor[(i * 3) + 2] = y;
-  }
-  return flat_tensor;
-}
-
-// ---------------------------------------------------------
-// MAIN
-// ---------------------------------------------------------
-int main() {
-  std::cout << "\n=== Smart Pen ML Decoder Booting ===\n";
-
-  // 1. Initialize ONNX Runtime
-  Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "SmartPen");
-  Ort::SessionOptions session_options;
-  session_options.SetIntraOpNumThreads(1); // Optimize for single CPU core
-
-  const char *model_path = "data/smart_pen.onnx";
-  Ort::Session session(env, model_path, session_options);
+  // 2. Define the Tensor Shapes
   Ort::MemoryInfo memory_info =
       Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  std::vector<int64_t> input_shape = {
+      1, static_cast<int64_t>(strokeBuffer.size()), 3};
 
-  std::cout << "[+] ONNX Neural Network loaded: " << model_path << "\n";
+  // 3. Create the ONNX Input Tensor
+  Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+      memory_info, input_tensor_values.data(), input_tensor_values.size(),
+      input_shape.data(), input_shape.size());
 
-  // 2. Connect to Hardware (Using your virtual simulator for now)
-  pen::SerialReader imu("/tmp/vtty_laptop");
-  if (!imu.isOpen()) {
-    std::cerr << "[-] Error: Simulator cable not found. Start socat first!\n";
-    return -1;
-  }
+  const char *input_names[] = {"input_stroke"};
+  const char *output_names[] = {"predicted_logits"};
 
-  std::vector<DataPoint> strokeBuffer;
-  strokeBuffer.reserve(1000);
-  EMAFilter filter;
-
-  // Define our two possible outputs (Since we trained on A and B)
-  std::vector<std::string> classes = {"A", "B"};
-
-  while (true) {
-    std::cout << "\n[READY] Press SPACEBAR to start writing...";
-    std::cout.flush();
-    while (!isSpacebarPressed()) {
-      usleep(10000);
-    }
-    getchar();
-
-    std::cout << "\n[DRAWING] Move the pen... Press SPACEBAR to finish.";
-    std::cout.flush();
-
-    strokeBuffer.clear();
-    filter.reset();
-    pen::IMUData currentData;
-
-    // High-Speed Recording Loop
-    while (true) {
-      if (isSpacebarPressed()) {
-        getchar();
-        break;
-      }
-      if (imu.readData(currentData)) {
-        filter.process(currentData);
-        strokeBuffer.push_back(
-            {currentData.pitch, currentData.roll, currentData.yaw});
-      }
-    }
-
-    if (strokeBuffer.empty())
-      continue;
-
-    // 3. Process the Data (Interpolate to 100 frames)
-    std::vector<float> input_tensor_values = resampleStroke(strokeBuffer, 100);
-
-    // 4. Run ONNX Inference
-    std::vector<int64_t> input_shape = {
-        1, 100, 3}; // Batch: 1, Frames: 100, Features: 3
-
-    // These strings must exactly match the names generated by Keras/tf2onnx
-    const char *input_names[] = {"input_layer"};
-    const char *output_names[] = {"classification"};
-
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        memory_info, input_tensor_values.data(), input_tensor_values.size(),
-        input_shape.data(), input_shape.size());
-
+  try {
+    // 4. RUN THE AI
     auto output_tensors = session.Run(Ort::RunOptions{nullptr}, input_names,
                                       &input_tensor, 1, output_names, 1);
 
-    // 5. Decode the Result
+    // 5. EXTRACT THE MATH (Shape: [1, Sequence_Length, Num_Classes])
     float *floatarr = output_tensors.front().GetTensorMutableData<float>();
+    auto output_type_info = output_tensors.front().GetTensorTypeAndShapeInfo();
+    auto output_shape = output_type_info.GetShape();
 
-    // Find the index with the highest probability (argmax)
-    int best_match_idx = (floatarr[0] > floatarr[1]) ? 0 : 1;
-    float confidence = floatarr[best_match_idx] * 100.0f;
+    int64_t seq_len = output_shape[1];
+    int64_t num_classes = output_shape[2];
 
-    std::cout << "\n----------------------------------------";
-    std::cout << "\n[PREDICTION]  =>  " << classes[best_match_idx]
-              << "  (Confidence: " << confidence << "%)";
-    std::cout << "\n----------------------------------------\n";
+    // 6. CTC GREEDY DECODING
+    std::string predicted_text = "";
+    int last_char_index = 0; // Starts at <BLANK>
+
+    for (int64_t t = 0; t < seq_len; ++t) {
+      int best_class = 0;
+      float max_prob = -1e9; // Start with a very low number
+
+      // Find the most likely character for this specific millisecond frame
+      for (int c = 0; c < num_classes; ++c) {
+        float prob = floatarr[t * num_classes + c];
+        if (prob > max_prob) {
+          max_prob = prob;
+          best_class = c;
+        }
+      }
+
+      // CTC Rule: Ignore <BLANK> (0) and ignore consecutive duplicates!
+      if (best_class != 0 && best_class != last_char_index) {
+        predicted_text += ALPHABET[best_class];
+      }
+
+      last_char_index = best_class;
+    }
+
+    std::cout << "\n====================================\n";
+    std::cout << ">> AI PREDICTION: \"" << predicted_text << "\"\n";
+    std::cout << "====================================\n\n";
+
+  } catch (const Ort::Exception &e) {
+    std::cerr << "[ONNX Error] " << e.what() << "\n";
+  }
+}
+
+// ---------------------------------------------------------
+// MAIN APPLICATION
+// ---------------------------------------------------------
+int main(int argc, char *argv[]) {
+  std::string mode = (argc > 1) ? argv[1] : "sim";
+
+  // --- 1. INITIALIZE AI ENGINE ---
+  std::cout << "[System] Booting ONNX Machine Learning Engine...\n";
+  Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "SmartPenDecoder");
+  Ort::SessionOptions session_options;
+  session_options.SetIntraOpNumThreads(
+      1); // Run efficiently on a single CPU core
+
+  // We wrap this in a try-catch to get EXACT error messages
+  std::unique_ptr<Ort::Session> session;
+  try {
+    session = std::make_unique<Ort::Session>(env, "models/pen_model.onnx",
+                                             session_options);
+    std::cout << "[System] AI Model 'pen_model.onnx' loaded successfully.\n";
+  } catch (const Ort::Exception &e) {
+    // This will print the actual mathematical or version error if it crashes!
+    std::cerr << "\n[FATAL ONNX ERROR] " << e.what() << "\n";
+  } catch (...) {
+    std::cerr << "\n[Warning] 'models/pen_model.onnx' not found!\n";
   }
 
+  // --- 2. INITIALIZE HARDWARE BACKEND ---
+  pen::PenBackend backend;
+  if (mode == "usb")
+    backend.connectUSB("/dev/ttyUSB0");
+  else if (mode == "wifi")
+    backend.connectWiFi(5005);
+  else
+    backend.connectUSB("/tmp/vtty_laptop");
+
+  std::cout << "Mode: " << backend.getStatus() << "\n";
+  std::cout << "--------------------------------\n";
+
+  // --- PHYSICAL TUNING PARAMETERS ---
+  const float LEVER_ARM_MM = 150.0f;
+  const float WAKE_THRESHOLD_Z = 0.5f;
+  const float ACTIVITY_THRESHOLD = 0.02f;
+  const int IDLE_TIMEOUT_MS = 2000;
+
+  std::vector<DataPoint> strokeBuffer;
+  strokeBuffer.reserve(5000);
+  pen::IMUData currentData, prevData, anchor;
+
+  while (true) {
+    std::cout << "\n[AI IDLE] Waiting for pen impact...\n";
+
+    // 1. WAKE-ON-IMPACT LOOP
+    bool isWriting = false;
+    while (!isWriting) {
+      if (backend.getLatestData(currentData)) {
+        if (std::abs(currentData.accel_z - prevData.accel_z) >
+            WAKE_THRESHOLD_Z) {
+          std::cout << "[AI ACTIVE] Impact detected. Reading stroke...\n";
+          anchor = currentData;
+          isWriting = true;
+        }
+        prevData = currentData;
+      }
+    }
+
+    // 2. CONTINUOUS WRITING LOOP
+    strokeBuffer.clear();
+    auto startTime = std::chrono::steady_clock::now();
+    long long lastActiveTime = 0;
+
+    while (isWriting) {
+      if (backend.getLatestData(currentData)) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - startTime)
+                             .count();
+
+        float dPitch = std::abs(currentData.pitch - prevData.pitch);
+        float dYaw = std::abs(currentData.yaw - prevData.yaw);
+        float z_shock = std::abs(currentData.accel_z - prevData.accel_z);
+
+        if (dPitch > ACTIVITY_THRESHOLD || dYaw > ACTIVITY_THRESHOLD ||
+            z_shock > WAKE_THRESHOLD_Z) {
+          lastActiveTime = elapsedMs;
+        }
+
+        float x_mm = -(currentData.yaw - anchor.yaw) * LEVER_ARM_MM;
+        float y_mm = (currentData.pitch - anchor.pitch) * LEVER_ARM_MM;
+        strokeBuffer.push_back({x_mm, y_mm, currentData.accel_z});
+
+        // 3. IDLE TIMEOUT -> TRIGGER AI INFERENCE!
+        if ((elapsedMs - lastActiveTime) > IDLE_TIMEOUT_MS) {
+          std::cout << "[AI PROCESSING] Idle timeout reached. Analyzing "
+                    << strokeBuffer.size() << " frames...\n";
+          isWriting = false;
+        }
+
+        prevData = currentData;
+      }
+    }
+
+    // 4. FEED THE BRAIN
+    if (strokeBuffer.size() > 20 && session) {
+      runAIInference(*session, strokeBuffer);
+    }
+  }
   return 0;
 }
