@@ -11,62 +11,13 @@
 
 namespace fs = std::filesystem;
 
-// A single row of our CSV
 struct DataPoint {
   long long timestamp;
-  float pitch;
-  float roll;
-  float yaw;
+  float pitch, roll, yaw;
 };
 
 // ---------------------------------------------------------
-// DATA FILTERING & ZERO-ANCHORING
-// ---------------------------------------------------------
-struct EMAFilter {
-  float alpha = 0.15f; // Tune this: 0.1 is smooth, 0.9 is raw
-  float filteredPitch = 0.0f;
-  float filteredRoll = 0.0f;
-  float filteredYaw = 0.0f;
-  bool isFirstFrame = true;
-
-  float startPitch = 0.0f;
-  float startRoll = 0.0f;
-  float startYaw = 0.0f;
-
-  void process(pen::IMUData &rawData) {
-    if (isFirstFrame) {
-      // Zero-Anchoring: Capture the starting orientation
-      startPitch = rawData.pitch;
-      startRoll = rawData.roll;
-      startYaw = rawData.yaw;
-
-      filteredPitch = 0.0f;
-      filteredRoll = 0.0f;
-      filteredYaw = 0.0f;
-      isFirstFrame = false;
-    }
-
-    // Subtract the anchor to make the stroke relative to (0,0,0)
-    float relativePitch = rawData.pitch - startPitch;
-    float relativeRoll = rawData.roll - startRoll;
-    float relativeYaw = rawData.yaw - startYaw;
-
-    // Apply the Exponential Moving Average (EMA) Low-Pass Filter
-    filteredPitch = (alpha * relativePitch) + ((1.0f - alpha) * filteredPitch);
-    filteredRoll = (alpha * relativeRoll) + ((1.0f - alpha) * filteredRoll);
-    filteredYaw = (alpha * relativeYaw) + ((1.0f - alpha) * filteredYaw);
-
-    // Overwrite the raw data with the clean data
-    rawData.pitch = filteredPitch;
-    rawData.roll = filteredRoll;
-    rawData.yaw = filteredYaw;
-  }
-
-  void reset() { isFirstFrame = true; }
-};
-
-// ---------------------------------------------------------
-// LINUX TERMINAL MAGIC: Non-blocking keyboard reads
+// TERMINAL I/O HELPER
 // ---------------------------------------------------------
 bool isSpacebarPressed() {
   struct termios oldt, newt;
@@ -75,14 +26,13 @@ bool isSpacebarPressed() {
 
   tcgetattr(STDIN_FILENO, &oldt);
   newt = oldt;
-  newt.c_lflag &= ~(ICANON | ECHO); // Disable buffering and echo
+  newt.c_lflag &= ~(ICANON | ECHO);
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
   oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
 
   ch = getchar();
 
-  // Restore original terminal settings
   tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
   fcntl(STDIN_FILENO, F_SETFL, oldf);
 
@@ -94,113 +44,127 @@ bool isSpacebarPressed() {
 }
 
 // ---------------------------------------------------------
+// CSV EXPORT HELPER
+// ---------------------------------------------------------
+void saveStrokeToCSV(const std::string &baseDir,
+                     const std::vector<DataPoint> &buffer, int &sampleCount) {
+  if (buffer.empty()) {
+    std::cout << "\n[WARNING] No data recorded. Try again.\n";
+    return;
+  }
+
+  std::string filename;
+  while (true) {
+    std::ostringstream oss;
+    oss << baseDir << "/sample_" << std::setw(3) << std::setfill('0')
+        << sampleCount << ".csv";
+    filename = oss.str();
+    if (!fs::exists(filename))
+      break;
+    sampleCount++;
+  }
+
+  std::ofstream outFile(filename);
+  outFile << "time_ms,pitch,roll,yaw\n";
+  for (const auto &pt : buffer) {
+    outFile << pt.timestamp << "," << pt.pitch << "," << pt.roll << ","
+            << pt.yaw << "\n";
+  }
+  outFile.close();
+
+  std::cout << "\n[SAVED] Captured " << buffer.size() << " data points to "
+            << filename << "\n";
+}
+
+// ---------------------------------------------------------
 // MAIN APPLICATION
 // ---------------------------------------------------------
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::cerr << "Usage: ./data_collector <character_label>\n";
-    std::cerr << "Example: ./data_collector A\n";
+    std::cerr << "Usage: ./data_collector <character_label> [mode]\n";
+    std::cerr << "Modes: sim, usb, bt, wifi\n";
+    std::cerr << "Example: ./data_collector A wifi\n";
     return -1;
   }
 
   std::string label = argv[1];
+  std::string mode = (argc > 2) ? argv[2] : "sim";
   std::string baseDir = "data/" + label;
 
-  // Create the directory if it doesn't exist
   if (!fs::exists(baseDir)) {
     fs::create_directories(baseDir);
   }
 
-  // pen::SerialReader imu("/dev/ttyUSB0");
-  pen::SerialReader imu("/tmp/vtty_laptop");
-  if (!imu.isOpen()) {
-    std::cerr << "Cannot proceed without hardware connection.\n";
-    return -1;
-  }
+  // 1. Initialize the shared Pen Backend
+  pen::PenBackend backend;
+  if (mode == "usb")
+    backend.connectUSB("/dev/ttyUSB0");
+  else if (mode == "bt")
+    backend.connectBluetooth("/dev/rfcomm0");
+  else if (mode == "wifi")
+    backend.connectWiFi(5005);
+  else
+    backend.connectUSB("/tmp/vtty_laptop");
+
+  std::cout << "\n=== Smart Pen Data Collector ===\n";
+  std::cout << "Target Character: '" << label << "'\n";
+  std::cout << "Connection:       " << backend.getStatus() << "\n";
+  std::cout << "Saving to:        " << baseDir << "\n";
+  std::cout << "--------------------------------\n";
 
   int sampleCount = 1;
   std::vector<DataPoint> strokeBuffer;
   strokeBuffer.reserve(1000);
-
-  EMAFilter strokeFilter;
-
-  std::cout << "\n=== Smart Pen Data Collector ===\n";
-  std::cout << "Target Character: '" << label << "'\n";
-  std::cout << "Saving to: " << baseDir << "\n";
-  std::cout << "--------------------------------\n";
 
   while (true) {
     std::cout
         << "\n[READY] Press SPACEBAR to START recording (or CTRL+C to quit)...";
     std::cout.flush();
 
-    // 1. Wait for Start Signal
     while (!isSpacebarPressed()) {
-      usleep(10000); // 10ms sleep
+      usleep(10000);
     }
-    getchar(); // Consume the spacebar character
+    getchar(); // Consume spacebar
 
     std::cout << "\n[RECORDING] Move the pen! Press SPACEBAR to STOP...";
     std::cout.flush();
 
     strokeBuffer.clear();
-    strokeFilter.reset(); // CRITICAL: Reset the zero-anchor for the new stroke
-
     pen::IMUData currentData;
+    pen::IMUData anchor;
+    bool isFirstFrame = true;
     auto startTime = std::chrono::steady_clock::now();
 
     // 2. High-Speed Recording Loop
     while (true) {
-      // Check for Stop Signal
       if (isSpacebarPressed()) {
-        getchar(); // Consume the spacebar
+        getchar();
         break;
       }
 
-      // If we have a fresh IMU packet, process it and save it to RAM
-      if (imu.readData(currentData)) {
+      // Backend handles I/O and EMA smoothing automatically!
+      if (backend.getLatestData(currentData)) {
 
-        // --- PASS RAW DATA THROUGH OUR FILTER ---
-        strokeFilter.process(currentData);
+        // Zero-Anchoring: Tare the pen to (0,0,0) at the start of the stroke
+        if (isFirstFrame) {
+          anchor = currentData;
+          isFirstFrame = false;
+        }
 
         auto now = std::chrono::steady_clock::now();
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                              now - startTime)
                              .count();
 
-        strokeBuffer.push_back(
-            {elapsedMs, currentData.pitch, currentData.roll, currentData.yaw});
+        // Save relative, smoothed data
+        strokeBuffer.push_back({elapsedMs, currentData.pitch - anchor.pitch,
+                                currentData.roll - anchor.roll,
+                                currentData.yaw - anchor.yaw});
       }
     }
 
-    // 3. Save to Disk (After the stroke is done)
-    if (strokeBuffer.empty()) {
-      std::cout << "\n[WARNING] No data recorded. Try again.\n";
-      continue;
-    }
-
-    // Auto-increment filename (e.g., sample_001.csv)
-    std::string filename;
-    while (true) {
-      std::ostringstream oss;
-      oss << baseDir << "/sample_" << std::setw(3) << std::setfill('0')
-          << sampleCount << ".csv";
-      filename = oss.str();
-      if (!fs::exists(filename))
-        break;
-      sampleCount++;
-    }
-
-    std::ofstream outFile(filename);
-    outFile << "time_ms,pitch,roll,yaw\n";
-    for (const auto &pt : strokeBuffer) {
-      outFile << pt.timestamp << "," << pt.pitch << "," << pt.roll << ","
-              << pt.yaw << "\n";
-    }
-    outFile.close();
-
-    std::cout << "\n[SAVED] Captured " << strokeBuffer.size()
-              << " data points to " << filename << "\n";
+    // 3. Delegate to CSV helper
+    saveStrokeToCSV(baseDir, strokeBuffer, sampleCount);
   }
 
   return 0;
