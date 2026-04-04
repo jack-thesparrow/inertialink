@@ -11,13 +11,41 @@
 namespace pen {
 
 // ==========================================
+// LOW-PASS FILTER MATH
+// ==========================================
+IMUFilter::IMUFilter(float alpha) : alpha(alpha), isFirstRun(true) {}
+
+void IMUFilter::reset() { isFirstRun = true; }
+
+void IMUFilter::setAlpha(float newAlpha) {
+  // Clamp alpha between 0.01 (max smoothing) and 1.0 (no smoothing)
+  alpha = std::fmax(0.01f, std::fmin(newAlpha, 1.0f));
+}
+
+IMUData IMUFilter::process(const IMUData &raw) {
+  if (isFirstRun) {
+    previous = raw;
+    isFirstRun = false;
+    return raw;
+  }
+
+  // The Magic Equation: Output = (Alpha * New) + ((1 - Alpha) * Old)
+  IMUData filtered;
+  filtered.pitch = (alpha * raw.pitch) + ((1.0f - alpha) * previous.pitch);
+  filtered.roll = (alpha * raw.roll) + ((1.0f - alpha) * previous.roll);
+  filtered.yaw = (alpha * raw.yaw) + ((1.0f - alpha) * previous.yaw);
+
+  previous = filtered;
+  return filtered;
+}
+
+// ==========================================
 // SERIAL READER (USB / BLUETOOTH)
 // ==========================================
 SerialReader::SerialReader(const std::string &portName) : fd(-1), bufPos(0) {
   fd = open(portName.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
   if (fd == -1) {
-    std::cerr << "[Serial] Failed to open " << portName
-              << " (Check permissions!)\n";
+    std::cerr << "[Serial] Failed to open " << portName << "\n";
     return;
   }
 
@@ -25,21 +53,16 @@ SerialReader::SerialReader(const std::string &portName) : fd(-1), bufPos(0) {
   tcgetattr(fd, &options);
   cfsetispeed(&options, B115200);
   cfsetospeed(&options, B115200);
-
   options.c_cflag |= (CLOCAL | CREAD | CS8);
   options.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
   options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-
   tcsetattr(fd, TCSANOW, &options);
   fcntl(fd, F_SETFL, FNDELAY);
-  std::cout << "[Serial] Connected to " << portName << "\n";
 }
 
 SerialReader::~SerialReader() {
-  if (fd >= 0) {
+  if (fd >= 0)
     close(fd);
-    std::cout << "[Serial] Port closed.\n";
-  }
 }
 
 bool SerialReader::isOpen() const { return fd >= 0; }
@@ -55,7 +78,6 @@ bool SerialReader::readData(IMUData &data) {
       buffer[bufPos] = '\0';
       float p, r, y;
       if (sscanf(buffer, "%f,%f,%f", &p, &r, &y) == 3) {
-        // Preserved your Radian conversion!
         data.pitch = p * (M_PI / 180.0f);
         data.roll = r * (M_PI / 180.0f);
         data.yaw = y * (M_PI / 180.0f);
@@ -74,10 +96,8 @@ bool SerialReader::readData(IMUData &data) {
 // ==========================================
 UDPReader::UDPReader(int port) : sockfd(-1), active(false) {
   sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sockfd < 0) {
-    std::cerr << "[UDP] Failed to create socket\n";
+  if (sockfd < 0)
     return;
-  }
 
   struct sockaddr_in servaddr;
   memset(&servaddr, 0, sizeof(servaddr));
@@ -88,19 +108,15 @@ UDPReader::UDPReader(int port) : sockfd(-1), active(false) {
   if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) >= 0) {
     active = true;
     fcntl(sockfd, F_SETFL, O_NONBLOCK);
-    std::cout << "[UDP] Listening on port " << port << "\n";
   } else {
-    std::cerr << "[UDP] Bind failed on port " << port << "\n";
     close(sockfd);
     sockfd = -1;
   }
 }
 
 UDPReader::~UDPReader() {
-  if (sockfd >= 0) {
+  if (sockfd >= 0)
     close(sockfd);
-    std::cout << "[UDP] Socket closed.\n";
-  }
 }
 
 bool UDPReader::isOpen() const { return active; }
@@ -109,13 +125,11 @@ bool UDPReader::readData(IMUData &data) {
   if (!active)
     return false;
   char buf[1024];
-
   int n = recvfrom(sockfd, (char *)buf, 1024, MSG_DONTWAIT, NULL, NULL);
   if (n > 0) {
     buf[n] = '\0';
     float p, r, y;
     if (sscanf(buf, "%f,%f,%f", &p, &r, &y) == 3) {
-      // Applied your Radian conversion to Wi-Fi data as well
       data.pitch = p * (M_PI / 180.0f);
       data.roll = r * (M_PI / 180.0f);
       data.yaw = y * (M_PI / 180.0f);
@@ -126,11 +140,17 @@ bool UDPReader::readData(IMUData &data) {
 }
 
 // ==========================================
-// PEN BACKEND CONTROLLER (FOR FTXUI)
+// PEN BACKEND CONTROLLER
 // ==========================================
 bool PenBackend::getLatestData(IMUData &data) {
-  if (activeReader && activeReader->isOpen()) {
-    return activeReader->readData(data);
+  IMUData rawData;
+  // 1. Fetch the noisy data from the hardware
+  if (activeReader && activeReader->isOpen() &&
+      activeReader->readData(rawData)) {
+    // 2. Pass it through the Low-Pass Filter before giving it to the
+    // Visualizer/ML
+    data = filter.process(rawData);
+    return true;
   }
   return false;
 }
@@ -139,21 +159,20 @@ std::string PenBackend::getStatus() const { return currentStatus; }
 
 void PenBackend::connectUSB(const std::string &port) {
   activeReader = std::make_unique<SerialReader>(port);
-  currentStatus = activeReader->isOpen() ? "Connected to USB: " + port
-                                         : "USB Failed: " + port;
+  filter.reset(); // Reset the filter when connecting to a new device!
+  currentStatus = activeReader->isOpen() ? "Connected to USB" : "USB Failed";
 }
 
 void PenBackend::connectBluetooth(const std::string &port) {
   activeReader = std::make_unique<SerialReader>(port);
-  currentStatus = activeReader->isOpen() ? "Connected to BT: " + port
-                                         : "BT Failed: " + port;
+  filter.reset();
+  currentStatus = activeReader->isOpen() ? "Connected to BT" : "BT Failed";
 }
 
 void PenBackend::connectWiFi(int listenPort) {
   activeReader = std::make_unique<UDPReader>(listenPort);
-  currentStatus = activeReader->isOpen()
-                      ? "Listening on UDP " + std::to_string(listenPort)
-                      : "WiFi Bind Failed";
+  filter.reset();
+  currentStatus = activeReader->isOpen() ? "Listening on WiFi" : "WiFi Failed";
 }
 
 void PenBackend::disconnect() {
