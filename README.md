@@ -16,3 +16,23 @@
   ```
 
 _Now your build files will be available in the `bin/` folder._
+
+---
+
+## Simulation without hardware
+
+Open a new separate terminal session. Add a virtual `tty` process to run in the
+background using:
+
+```bash
+socat PTY,link=/tmp/vtty_esp32,raw,echo=0 PTY,link=/tmp/vtty_laptop,raw,echo=0 &
+```
+
+Now in a python virtual environment run the `mock_esp32.py`:
+
+```bash
+python3 scripts/mock_esp32.py
+```
+
+This creates synthetic strokes of sine waves emulating the pen stroke. Visualize
+them using `bin/visualizer`.
