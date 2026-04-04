@@ -3,7 +3,12 @@ pandas>=2.0.0
 scipy>=1.10.0
 scikit-learn>=1.2.0
 matplotlib>=3.7.0
-tensorflow>=2.15.0
 tabulate>=0.9.0
-tf2onnx
-onnx
+
+# --- The New ML Brain ---
+torch>=2.0.0
+onnx>=1.14.0
+
+# --- Optional (For Python testing) ---
+onnxruntime>=1.16.0
+onnxscript
