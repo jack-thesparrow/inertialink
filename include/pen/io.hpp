@@ -10,6 +10,20 @@ struct IMUData {
   float yaw = 0.0f;
 };
 
+// --- SIGNAL PROCESSING: LOW-PASS FILTER ---
+class IMUFilter {
+public:
+  IMUFilter(float alpha = 0.2f); // 0.2 is the sweet spot for IMU smoothing
+  IMUData process(const IMUData &raw);
+  void reset();
+  void setAlpha(float newAlpha);
+
+private:
+  float alpha;
+  IMUData previous;
+  bool isFirstRun;
+};
+
 // --- ABSTRACT BASE CLASS ---
 class IMUReader {
 public:
@@ -29,8 +43,8 @@ public:
 
 private:
   int fd;
-  char buffer[256]; // Fixed: Now a char array to match your loop!
-  int bufPos;       // Fixed: Added bufPos to track the index!
+  char buffer[256];
+  int bufPos;
 };
 
 // --- WI-FI UDP READER ---
@@ -58,8 +72,12 @@ public:
   void connectWiFi(int listenPort = 5005);
   void disconnect();
 
+  // Allow the future UI to adjust smoothing on the fly!
+  void setSmoothing(float alpha) { filter.setAlpha(alpha); }
+
 private:
   std::unique_ptr<IMUReader> activeReader;
+  IMUFilter filter; // The backend now owns a filter
   std::string currentStatus = "Disconnected";
 };
 
