@@ -111,8 +111,8 @@ int main(int argc, char *argv[]) {
     fs::create_directories(baseDir);
   }
 
-  pen::SerialReader imu("/dev/ttyUSB0");
-  // pen::SerialReader imu("/tmp/vtty_laptop");
+  // pen::SerialReader imu("/dev/ttyUSB0");
+  pen::SerialReader imu("/tmp/vtty_laptop");
   if (!imu.isOpen()) {
     std::cerr << "Cannot proceed without hardware connection.\n";
     return -1;
