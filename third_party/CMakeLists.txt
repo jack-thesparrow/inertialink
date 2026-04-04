@@ -23,7 +23,7 @@ FetchContent_MakeAvailable(glm)
 add_library(glad STATIC glad/src/glad.c)
 target_include_directories(glad PUBLIC glad/include)
 
-# --- ONNX Runtime डाउनलोड ---
+# --- ONNX Runtime --
 FetchContent_Declare(
     onnxruntime
     URL https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
