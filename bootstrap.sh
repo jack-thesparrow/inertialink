@@ -88,7 +88,30 @@ if [ -c /dev/ttyUSB0 ]; then
   echo "    Granted immediate read/write access to /dev/ttyUSB0."
 fi
 
-# --- 5. NEXT STEPS & TROUBLESHOOTING SUMMARY ---
+# --- 5. INSTALL PLATFORMIO UDEV RULES ---
+echo ""
+echo "[+] Installing PlatformIO UDEV Rules (Fixes USB flashing issues)..."
+if [ ! -f "/etc/udev/rules.d/99-platformio-udev.rules" ]; then
+  curl -fsSL https://raw.githubusercontent.com/platformio/platformio-core/master/scripts/99-platformio-udev.rules | sudo tee /etc/udev/rules.d/99-platformio-udev.rules >/dev/null
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger
+  echo "    Rules installed and udev reloaded."
+else
+  echo "    UDEV rules already installed."
+fi
+
+# --- 6. PRE-COMPILE ESP32 FIRMWARE ---
+echo ""
+echo "[+] Pre-compiling ESP32 Firmware (This will take a while)..."
+if [ -d "esp32_firmware" ]; then
+  # Call the isolated pio binary directly, target just the build process (no upload)
+  "$HOME/.platformio/penv/bin/pio" run -d esp32_firmware
+  echo "    Firmware successfully pre-compiled!"
+else
+  echo "    [!] Directory 'esp32_firmware' not found. Skipping pre-compile."
+fi
+
+# --- 7. NEXT STEPS & TROUBLESHOOTING SUMMARY ---
 echo ""
 echo "========================================"
 echo " SETUP COMPLETE - NEXT STEPS"
