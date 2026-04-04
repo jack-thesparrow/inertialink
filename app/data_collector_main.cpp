@@ -1,57 +1,29 @@
 #include "pen/io.hpp"
 #include <chrono>
-#include <fcntl.h>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <termios.h>
-#include <unistd.h>
 #include <vector>
 
 namespace fs = std::filesystem;
 
+// ML Input Tensor Format
 struct DataPoint {
   long long timestamp;
-  float pitch, roll, yaw;
+  float x;       // Lever-Arm Projected X
+  float y;       // Lever-Arm Projected Y
+  float accel_z; // Raw Z-Axis Impact
 };
-
-// ---------------------------------------------------------
-// TERMINAL I/O HELPER
-// ---------------------------------------------------------
-bool isSpacebarPressed() {
-  struct termios oldt, newt;
-  int ch;
-  int oldf;
-
-  tcgetattr(STDIN_FILENO, &oldt);
-  newt = oldt;
-  newt.c_lflag &= ~(ICANON | ECHO);
-  tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-  oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
-  fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
-
-  ch = getchar();
-
-  tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-  fcntl(STDIN_FILENO, F_SETFL, oldf);
-
-  if (ch != EOF) {
-    ungetc(ch, stdin);
-    return (ch == ' ');
-  }
-  return false;
-}
 
 // ---------------------------------------------------------
 // CSV EXPORT HELPER
 // ---------------------------------------------------------
 void saveStrokeToCSV(const std::string &baseDir,
                      const std::vector<DataPoint> &buffer, int &sampleCount) {
-  if (buffer.empty()) {
-    std::cout << "\n[WARNING] No data recorded. Try again.\n";
+  if (buffer.empty())
     return;
-  }
 
   std::string filename;
   while (true) {
@@ -65,14 +37,13 @@ void saveStrokeToCSV(const std::string &baseDir,
   }
 
   std::ofstream outFile(filename);
-  outFile << "time_ms,pitch,roll,yaw\n";
+  outFile << "time_ms,x,y,accel_z\n";
   for (const auto &pt : buffer) {
-    outFile << pt.timestamp << "," << pt.pitch << "," << pt.roll << ","
-            << pt.yaw << "\n";
+    outFile << pt.timestamp << "," << pt.x << "," << pt.y << "," << pt.accel_z
+            << "\n";
   }
   outFile.close();
-
-  std::cout << "\n[SAVED] Captured " << buffer.size() << " data points to "
+  std::cout << "[SAVED] Captured " << buffer.size() << " data points to "
             << filename << "\n";
 }
 
@@ -81,21 +52,16 @@ void saveStrokeToCSV(const std::string &baseDir,
 // ---------------------------------------------------------
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::cerr << "Usage: ./data_collector <character_label> [mode]\n";
-    std::cerr << "Modes: sim, usb, bt, wifi\n";
-    std::cerr << "Example: ./data_collector A wifi\n";
+    std::cerr << "Usage: ./data_collector <character_or_word> [mode]\n";
     return -1;
   }
 
   std::string label = argv[1];
   std::string mode = (argc > 2) ? argv[2] : "sim";
   std::string baseDir = "data/" + label;
-
-  if (!fs::exists(baseDir)) {
+  if (!fs::exists(baseDir))
     fs::create_directories(baseDir);
-  }
 
-  // 1. Initialize the shared Pen Backend
   pen::PenBackend backend;
   if (mode == "usb")
     backend.connectUSB("/dev/ttyUSB0");
@@ -106,66 +72,91 @@ int main(int argc, char *argv[]) {
   else
     backend.connectUSB("/tmp/vtty_laptop");
 
-  std::cout << "\n=== Smart Pen Data Collector ===\n";
-  std::cout << "Target Character: '" << label << "'\n";
-  std::cout << "Connection:       " << backend.getStatus() << "\n";
-  std::cout << "Saving to:        " << baseDir << "\n";
-  std::cout << "--------------------------------\n";
+  std::cout << "\n=== Smart Pen Autonomous Collector ===\n";
+  std::cout << "Target: " << label << " | Mode: " << backend.getStatus()
+            << "\n";
+
+  // --- PHYSICAL TUNING PARAMETERS ---
+  const float LEVER_ARM_MM = 150.0f; // Distance from wrist pivot to pen tip
+  const float WAKE_THRESHOLD_Z =
+      0.5f; // How hard the pen must hit paper to wake up
+  const float ACTIVITY_THRESHOLD =
+      0.02f; // Minimum angular movement (radians) to stay awake
+  const int IDLE_TIMEOUT_MS =
+      2000; // Milliseconds of stillness before auto-saving
 
   int sampleCount = 1;
   std::vector<DataPoint> strokeBuffer;
-  strokeBuffer.reserve(1000);
+  strokeBuffer.reserve(5000);
+
+  pen::IMUData currentData, prevData, anchor;
 
   while (true) {
-    std::cout
-        << "\n[READY] Press SPACEBAR to START recording (or CTRL+C to quit)...";
-    std::cout.flush();
+    std::cout << "\n[IDLE] Waiting for pen impact on paper...\n";
 
-    while (!isSpacebarPressed()) {
-      usleep(10000);
-    }
-    getchar(); // Consume spacebar
-
-    std::cout << "\n[RECORDING] Move the pen! Press SPACEBAR to STOP...";
-    std::cout.flush();
-
-    strokeBuffer.clear();
-    pen::IMUData currentData;
-    pen::IMUData anchor;
-    bool isFirstFrame = true;
-    auto startTime = std::chrono::steady_clock::now();
-
-    // 2. High-Speed Recording Loop
-    while (true) {
-      if (isSpacebarPressed()) {
-        getchar();
-        break;
-      }
-
-      // Backend handles I/O and EMA smoothing automatically!
+    // 1. WAKE-ON-IMPACT LOOP
+    bool isWriting = false;
+    while (!isWriting) {
       if (backend.getLatestData(currentData)) {
+        // Calculate the Z-axis shockwave
+        float z_shock = std::abs(currentData.accel_z - prevData.accel_z);
 
-        // Zero-Anchoring: Tare the pen to (0,0,0) at the start of the stroke
-        if (isFirstFrame) {
-          anchor = currentData;
-          isFirstFrame = false;
+        if (z_shock > WAKE_THRESHOLD_Z) {
+          std::cout << "[RECORDING] Impact detected! Writing...\n";
+          anchor = currentData; // Tare the grip angle instantly upon impact
+          isWriting = true;
         }
+        prevData = currentData;
+      }
+    }
+
+    // 2. CONTINUOUS WRITING LOOP
+    strokeBuffer.clear();
+    auto startTime = std::chrono::steady_clock::now();
+    long long lastActiveTime = 0;
+
+    while (isWriting) {
+      if (backend.getLatestData(currentData)) {
 
         auto now = std::chrono::steady_clock::now();
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                              now - startTime)
                              .count();
 
-        // Save relative, smoothed data
-        strokeBuffer.push_back({elapsedMs, currentData.pitch - anchor.pitch,
-                                currentData.roll - anchor.roll,
-                                currentData.yaw - anchor.yaw});
+        // Calculate deltas to see if the pen is currently moving
+        float dPitch = std::abs(currentData.pitch - prevData.pitch);
+        float dYaw = std::abs(currentData.yaw - prevData.yaw);
+        float z_shock = std::abs(currentData.accel_z - prevData.accel_z);
+
+        // If moving or tapping, reset the sleep timer
+        if (dPitch > ACTIVITY_THRESHOLD || dYaw > ACTIVITY_THRESHOLD ||
+            z_shock > WAKE_THRESHOLD_Z) {
+          lastActiveTime = elapsedMs;
+        }
+
+        // Project the relative angles into 2D canvas coordinates
+        float relYaw = currentData.yaw - anchor.yaw;
+        float relPitch = currentData.pitch - anchor.pitch;
+        float x_mm = -relYaw * LEVER_ARM_MM;
+        float y_mm = relPitch * LEVER_ARM_MM;
+
+        strokeBuffer.push_back({elapsedMs, x_mm, y_mm, currentData.accel_z});
+
+        // 3. IDLE TIMEOUT LOGIC
+        if ((elapsedMs - lastActiveTime) > IDLE_TIMEOUT_MS) {
+          std::cout << "[STOP] Pen idle for " << (IDLE_TIMEOUT_MS / 1000)
+                    << " seconds. Halting read.\n";
+          isWriting = false;
+        }
+
+        prevData = currentData;
       }
     }
 
-    // 3. Delegate to CSV helper
-    saveStrokeToCSV(baseDir, strokeBuffer, sampleCount);
+    // Save only if it wasn't a tiny accidental bump
+    if (strokeBuffer.size() > 20) {
+      saveStrokeToCSV(baseDir, strokeBuffer, sampleCount);
+    }
   }
-
   return 0;
 }
