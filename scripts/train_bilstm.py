@@ -222,7 +222,11 @@ def train_and_export():
             )
 
     except KeyboardInterrupt:
-        print(f"\n\n[Interrupted at epoch {epoch+1}] Exporting model with best loss {best_loss:.4f} ...")
+        print(f"\n\n[Interrupted] ", end="")
+        if best_loss == float("inf"):
+            print("No epoch completed — nothing to export. Re-run and let at least 1 epoch finish.")
+            return
+        print(f"Exporting model at best loss {best_loss:.4f} ...")
 
     # ---------------------------------------------------------
     # 6. ONNX EXPORT FOR C++
