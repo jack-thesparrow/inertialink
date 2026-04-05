@@ -127,7 +127,7 @@ def train_and_export():
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     # Halve LR whenever loss plateaus for 10 epochs straight
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10, verbose=True
+        optimizer, mode="min", factor=0.5, patience=10
     )
 
     # CTC Loss is the magic that allows continuous variable-length reading
