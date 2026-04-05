@@ -1,6 +1,7 @@
 # scripts / train_bilstm.py
 import os
 import glob
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -27,8 +28,19 @@ NUM_CLASSES = len(ALPHABET)
 # 2. NEURAL NETWORK ARCHITECTURE
 # ---------------------------------------------------------
 class SmartPenDecoder(nn.Module):
-    def __init__(self):
+    """BiLSTM CTC decoder with baked-in z-score normalization.
+
+    Normalization stats are registered as buffers so they are part of the
+    ONNX export — the C++ decoder sends raw mm/accel values and gets
+    logits back without needing any preprocessing code on its side.
+    """
+
+    def __init__(self, input_mean: torch.Tensor, input_std: torch.Tensor):
         super(SmartPenDecoder, self).__init__()
+        # Buffers travel with the model into ONNX; they are NOT trainable.
+        self.register_buffer("input_mean", input_mean)
+        self.register_buffer("input_std",  input_std)
+
         self.lstm = nn.LSTM(
             input_size=INPUT_FEATURES,
             hidden_size=HIDDEN_SIZE,
@@ -41,7 +53,8 @@ class SmartPenDecoder(nn.Module):
         self.fc = nn.Linear(HIDDEN_SIZE * 2, NUM_CLASSES)
 
     def forward(self, x):
-        # x shape: (Batch, Seq_Len, Features)
+        # x shape: (Batch, Seq_Len, Features) — raw values from C++
+        x = (x - self.input_mean) / (self.input_std + 1e-8)
         lstm_out, _ = self.lstm(x)
         logits = self.fc(lstm_out)
         # logits shape: (Batch, Seq_Len, Num_Classes)
@@ -96,20 +109,35 @@ def train_and_export():
 
     print(f"Loaded {len(X_train)} stroke samples.")
 
-    model = SmartPenDecoder()
+    # --- Compute normalization stats from the whole training set ---
+    # Stack all frames to get a (TotalFrames, 3) tensor, then take mean/std
+    # per feature.  These stats are baked into the model so C++ sends raw
+    # values and the ONNX graph normalizes them internally.
+    all_frames = torch.cat(X_train, dim=0)  # (N_total_frames, 3)
+    feat_mean = all_frames.mean(dim=0)      # (3,)
+    feat_std  = all_frames.std(dim=0)       # (3,)
+    print(f"Feature mean: {feat_mean.tolist()}")
+    print(f"Feature std:  {feat_std.tolist()}")
+
+    model = SmartPenDecoder(feat_mean, feat_std)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # CTC Loss is the magic that allows continuous variable-length reading
     ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
 
     model.train()
-    epochs = 50
+    epochs = 150  # More epochs — CTC needs loss well below 0.1 to decode reliably
+
+    indices = list(range(len(X_train)))
 
     for epoch in range(epochs):
         total_loss = 0
 
-        # Training one sample at a time handles variable lengths gracefully
-        for x, y in zip(X_train, Y_train):
+        # Shuffle each epoch so the model learns the signal, not the order
+        random.shuffle(indices)
+
+        for i in indices:
+            x, y = X_train[i], Y_train[i]
             optimizer.zero_grad()
 
             # Add Batch Dimension: (Seq_Len, 3) -> (1, Seq_Len, 3)
@@ -124,10 +152,12 @@ def train_and_export():
 
             loss = ctc_loss(logits_ctc.log_softmax(2), y, input_lengths, target_lengths)
             loss.backward()
+            # Gradient clipping — LSTMs blow up without it
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             total_loss += loss.item()
 
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(X_train):.4f}")
 
     # ---------------------------------------------------------
