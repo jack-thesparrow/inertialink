@@ -298,12 +298,13 @@ def train_and_export():
 
             # Move to new line and print the epoch summary
             stop_marker = f"  [no improvement {no_improve}/{PATIENCE}]" if no_improve > 0 else ""
-            print(
-                f"\rEpoch {epoch+1:>4}/{EPOCHS}  "
+            line = (
+                f"Epoch {epoch+1:>4}/{EPOCHS}  "
                 f"loss={avg_loss:.4f}  best={best_loss:.4f}  lr={lr:.2e}"
                 + stop_marker
-                + " " * 5
             )
+            # Pad to 80 chars so any leftover progress-bar text is overwritten
+            print(f"\r{line:<80}")
 
             # Early stopping: plateau detected
             if no_improve >= PATIENCE:
