@@ -137,6 +137,20 @@ int main(int argc, char *argv[]) {
   else // "wifi" (default) — matches mock_esp32.py
     backend.connectWiFi(pen::Defaults::wifiPort);
 
+  // Alpha=1.0 bypasses the low-pass filter (passthrough).
+  //
+  // Why: training CSVs already contain once-filtered x/y (the data_collector
+  // applied the filter when writing them).  If we filter again here the mock
+  // would feed double-smoothed, lagged values to the model — a completely
+  // different signal from what it trained on.  With alpha=1.0 the round-trip
+  // is exact: mock reads x_csv → converts to angle → io.cpp converts back →
+  // no extra filter → x_inf == x_csv.
+  //
+  // For real ESP32 hardware (which sends raw noisy angles) you may re-enable
+  // smoothing by passing a lower alpha, e.g. backend.setSmoothing(0.2f), and
+  // re-collecting training data with the same setting.
+  backend.setSmoothing(1.0f);
+
   std::cout << "Mode: " << backend.getStatus() << "\n";
   std::cout << "--------------------------------\n";
 
