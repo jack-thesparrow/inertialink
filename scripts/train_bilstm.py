@@ -157,68 +157,72 @@ def train_and_export():
     import sys, time
 
     model.train()
-    for epoch in range(EPOCHS):
-        # --- Set LR manually (warm-up + cosine) ---
-        lr = get_lr(epoch, EPOCHS, WARMUP_EPOCHS, BASE_LR)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+    try:
+        for epoch in range(EPOCHS):
+            # --- Set LR manually (warm-up + cosine) ---
+            lr = get_lr(epoch, EPOCHS, WARMUP_EPOCHS, BASE_LR)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
 
-        total_loss  = 0.0
-        batch_count = 0
-        random.shuffle(indices)
+            total_loss  = 0.0
+            batch_count = 0
+            random.shuffle(indices)
 
-        # --- Mini-batch loop with in-line progress bar ---
-        for batch_start in range(0, n, BATCH_SIZE):
-            batch_idx = indices[batch_start : batch_start + BATCH_SIZE]
+            # --- Mini-batch loop with in-line progress bar ---
+            for batch_start in range(0, n, BATCH_SIZE):
+                batch_idx = indices[batch_start : batch_start + BATCH_SIZE]
 
-            optimizer.zero_grad()
-            batch_loss = 0.0
+                optimizer.zero_grad()
+                batch_loss = 0.0
 
-            for i in batch_idx:
-                x, y = X_train[i], Y_train[i]
+                for i in batch_idx:
+                    x, y = X_train[i], Y_train[i]
 
-                # Add Batch Dimension: (Seq_Len, 3) -> (1, Seq_Len, 3)
-                x_batched = x.unsqueeze(0)
-                logits = model(x_batched)
+                    # Add Batch Dimension: (Seq_Len, 3) -> (1, Seq_Len, 3)
+                    x_batched = x.unsqueeze(0)
+                    logits = model(x_batched)
 
-                # CTC Loss expects: (Seq_Len, Batch, Num_Classes)
-                logits_ctc = logits.transpose(0, 1)
+                    # CTC Loss expects: (Seq_Len, Batch, Num_Classes)
+                    logits_ctc = logits.transpose(0, 1)
 
-                input_lengths  = torch.tensor([logits_ctc.size(0)], dtype=torch.long)
-                target_lengths = torch.tensor([y.size(0)],          dtype=torch.long)
+                    input_lengths  = torch.tensor([logits_ctc.size(0)], dtype=torch.long)
+                    target_lengths = torch.tensor([y.size(0)],          dtype=torch.long)
 
-                loss = ctc_loss(
-                    logits_ctc.log_softmax(2), y, input_lengths, target_lengths
+                    loss = ctc_loss(
+                        logits_ctc.log_softmax(2), y, input_lengths, target_lengths
+                    )
+                    batch_loss += loss
+
+                # Average the loss over the mini-batch then back-prop once
+                (batch_loss / len(batch_idx)).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                total_loss  += batch_loss.item()
+                batch_count += 1
+
+                # Overwrite same line with a mini progress bar
+                filled = int(bar_width * batch_count / n_batches)
+                bar    = "#" * filled + "-" * (bar_width - filled)
+                sys.stdout.write(
+                    f"\rEpoch {epoch+1:>4}/{EPOCHS}  [{bar}]  "
+                    f"batch {batch_count}/{n_batches}  "
+                    f"lr={lr:.2e}"
                 )
-                batch_loss += loss
+                sys.stdout.flush()
 
-            # Average the loss over the mini-batch then back-prop once
-            (batch_loss / len(batch_idx)).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
-            total_loss  += batch_loss.item()
-            batch_count += 1
+            avg_loss = total_loss / n
+            if avg_loss < best_loss:
+                best_loss = avg_loss
 
-            # Overwrite same line with a mini progress bar
-            filled = int(bar_width * batch_count / n_batches)
-            bar    = "#" * filled + "-" * (bar_width - filled)
-            sys.stdout.write(
-                f"\rEpoch {epoch+1:>4}/{EPOCHS}  [{bar}]  "
-                f"batch {batch_count}/{n_batches}  "
-                f"lr={lr:.2e}"
+            # Move to new line and print the epoch summary
+            print(
+                f"\rEpoch {epoch+1:>4}/{EPOCHS}  "
+                f"loss={avg_loss:.4f}  best={best_loss:.4f}  lr={lr:.2e}"
+                + " " * 10  # clear any leftover bar characters
             )
-            sys.stdout.flush()
 
-        avg_loss = total_loss / n
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-
-        # Move to new line and print the epoch summary
-        print(
-            f"\rEpoch {epoch+1:>4}/{EPOCHS}  "
-            f"loss={avg_loss:.4f}  best={best_loss:.4f}  lr={lr:.2e}"
-            + " " * 10  # clear any leftover bar characters
-        )
+    except KeyboardInterrupt:
+        print(f"\n\n[Interrupted at epoch {epoch+1}] Exporting model with best loss {best_loss:.4f} ...")
 
     # ---------------------------------------------------------
     # 6. ONNX EXPORT FOR C++
