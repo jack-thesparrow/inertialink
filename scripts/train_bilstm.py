@@ -51,7 +51,7 @@ NUM_LAYERS     = 3    # 3 stacked BiLSTM layers
 NUM_CLASSES    = len(ALPHABET)  # 64
 
 EPOCHS         = 500
-BATCH_SIZE     = 128  # Bigger batches = more sustained GPU work per call
+BATCH_SIZE     = 64   # 128 OOMs on Arc 530M (shared LPDDR5); use 32 if still OOM
 WARMUP_EPOCHS  = 20   # Linear LR warm-up before cosine decay
 BASE_LR        = 3e-4
 
