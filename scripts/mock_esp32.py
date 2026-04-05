@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import socket
@@ -18,12 +19,14 @@ def stream_csv(filepath):
     print(f"\n[Hardware] Streaming {filepath} at 100Hz...")
 
     for index, row in df.iterrows():
-        # REVERSE PHYSICS: Convert the 2D CSV data back into raw 3D IMU angles
-        # C++ did: x = -yaw * 150  -> So we do: yaw = -x / 150
-        # C++ did: y = pitch * 150 -> So we do: pitch = y / 150
+        # REVERSE PHYSICS: Convert the 2D CSV data back into raw 3D IMU angles.
+        # C++ did: x = -yaw_rad * 150  -> yaw_rad = -x / 150
+        # C++ did: y = pitch_rad * 150 -> pitch_rad = y / 150
+        # io.cpp multiplies by (pi/180) expecting DEGREES (like real ESP32 firmware),
+        # so we must convert our radian angles to degrees before sending.
 
-        yaw = -(row["x"] / LEVER_ARM_MM)
-        pitch = row["y"] / LEVER_ARM_MM
+        yaw = math.degrees(-(row["x"] / LEVER_ARM_MM))
+        pitch = math.degrees(row["y"] / LEVER_ARM_MM)
         roll = 0.0  # We didn't simulate roll
         accel_z = row["accel_z"]
 

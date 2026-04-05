@@ -131,7 +131,7 @@ bool UDPReader::isOpen() const { return active; }
 bool UDPReader::readData(IMUData &data) {
   if (!active)
     return false;
-  char buf[1024];
+  char buf[1025]; // +1 so buf[n] = '\0' is always in bounds
   int n = recvfrom(sockfd, (char *)buf, 1024, MSG_DONTWAIT, NULL, NULL);
   if (n > 0) {
     buf[n] = '\0';
@@ -168,24 +168,43 @@ std::string PenBackend::getStatus() const { return currentStatus; }
 
 void PenBackend::connectUSB(const std::string &port) {
   activeReader = std::make_unique<SerialReader>(port);
-  filter.reset(); // Reset the filter when connecting to a new device!
-  currentStatus = activeReader->isOpen() ? "Connected to USB" : "USB Failed";
+  filter.reset();
+  if (activeReader->isOpen()) {
+    currentMode   = ConnectionMode::USB;
+    currentStatus = "Connected via USB (" + port + ")";
+  } else {
+    currentMode   = ConnectionMode::None;
+    currentStatus = "USB Failed (" + port + ")";
+  }
 }
 
 void PenBackend::connectBluetooth(const std::string &port) {
   activeReader = std::make_unique<SerialReader>(port);
   filter.reset();
-  currentStatus = activeReader->isOpen() ? "Connected to BT" : "BT Failed";
+  if (activeReader->isOpen()) {
+    currentMode   = ConnectionMode::Bluetooth;
+    currentStatus = "Connected via Bluetooth (" + port + ")";
+  } else {
+    currentMode   = ConnectionMode::None;
+    currentStatus = "Bluetooth Failed (" + port + ")";
+  }
 }
 
 void PenBackend::connectWiFi(int listenPort) {
   activeReader = std::make_unique<UDPReader>(listenPort);
   filter.reset();
-  currentStatus = activeReader->isOpen() ? "Listening on WiFi" : "WiFi Failed";
+  if (activeReader->isOpen()) {
+    currentMode   = ConnectionMode::WiFi;
+    currentStatus = "Listening on WiFi (port " + std::to_string(listenPort) + ")";
+  } else {
+    currentMode   = ConnectionMode::None;
+    currentStatus = "WiFi Failed (port " + std::to_string(listenPort) + ")";
+  }
 }
 
 void PenBackend::disconnect() {
   activeReader.reset();
+  currentMode   = ConnectionMode::None;
   currentStatus = "Disconnected";
 }
 
