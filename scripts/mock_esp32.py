@@ -40,8 +40,11 @@ def stream_csv(filepath):
 if __name__ == "__main__":
     # Let's test the AI by sending it the word "hello"
     sample_file = "data/hello/sample_001.csv"
+    target_word = os.path.basename(os.path.dirname(sample_file))
 
     if os.path.exists(sample_file):
+        print(f"\n[Hardware] Target word: \"{target_word}\"  <-- compare this to the AI prediction")
+
         # 1. Send idle data for a second to let C++ calibrate
         print("[Hardware] Sending idle data...")
         for _ in range(100):
@@ -52,7 +55,7 @@ if __name__ == "__main__":
         stream_csv(sample_file)
 
         # 3. Send idle data so the C++ triggers the 2-second timeout
-        print("[Hardware] Pen lifted. Waiting for AI to process...")
+        print(f"[Hardware] Pen lifted. Sent: \"{target_word}\" — waiting for AI to process...")
         for _ in range(250):
             sock.sendto(b"0.0,0.0,0.0,0.0\n", (UDP_IP, UDP_PORT))
             time.sleep(0.01)
