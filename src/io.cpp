@@ -131,7 +131,7 @@ bool UDPReader::isOpen() const { return active; }
 bool UDPReader::readData(IMUData &data) {
   if (!active)
     return false;
-  char buf[1024];
+  char buf[1025]; // +1 so buf[n] = '\0' is always in bounds
   int n = recvfrom(sockfd, (char *)buf, 1024, MSG_DONTWAIT, NULL, NULL);
   if (n > 0) {
     buf[n] = '\0';

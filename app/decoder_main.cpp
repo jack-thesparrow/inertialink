@@ -101,7 +101,9 @@ void runAIInference(Ort::Session &session,
 // MAIN APPLICATION
 // ---------------------------------------------------------
 int main(int argc, char *argv[]) {
-  std::string mode = (argc > 1) ? argv[1] : "sim";
+  // Default to "wifi" so `./bin/decoder` works out-of-the-box with mock_esp32.py.
+  // Use "usb" or "bt" for physical hardware.
+  std::string mode = (argc > 1) ? argv[1] : "wifi";
 
   // --- 1. INITIALIZE AI ENGINE ---
   std::cout << "[System] Booting ONNX Machine Learning Engine...\n";
