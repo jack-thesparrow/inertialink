@@ -135,7 +135,6 @@ def train_and_export():
     # ---------------------------------------------------------
     import warnings
     import onnx
-    from torch.export import Dim
 
     warnings.filterwarnings("ignore")
     os.makedirs("models", exist_ok=True)
@@ -144,20 +143,23 @@ def train_and_export():
     model.eval()
     dummy_input = torch.randn(1, 150, INPUT_FEATURES)
 
-    # Define dynamic shapes
-    seq_len_dim = Dim("seq_len", min=1, max=10000)
-    dynamic_shapes = {"x": {1: seq_len_dim}}
-
+    # Use the legacy TorchScript-based exporter (dynamo=False) with dynamic_axes.
+    # The newer dynamo exporter conflicts when the dummy input has a fixed sequence
+    # length (150) but the dimension is declared dynamic via Dim objects.
     torch.onnx.export(
         model,
         (dummy_input,),
         onnx_path,
+        dynamo=False,
         export_params=True,
         opset_version=17,
         do_constant_folding=True,
         input_names=["input_stroke"],
         output_names=["predicted_logits"],
-        dynamic_shapes=dynamic_shapes,
+        dynamic_axes={
+            "input_stroke":    {1: "seq_len"},
+            "predicted_logits": {1: "seq_len"},
+        },
     )
 
     # --- THE MAGIC FIX FOR C++ ---
