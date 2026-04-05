@@ -14,9 +14,10 @@ struct DataPoint {
   float accel_z;
 };
 
-// The exact alphabet from our PyTorch script! Index 0 is <BLANK>
+// Must match train_bilstm.py exactly.  Index 0 ('~') is the CTC blank — it is
+// always skipped by the decoder.  Real characters start at index 1.
 const std::string ALPHABET =
-    "<BLANK> abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 // ---------------------------------------------------------
 // ONNX INFERENCE & CTC DECODER

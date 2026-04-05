@@ -12,16 +12,20 @@ import numpy as np
 # ---------------------------------------------------------
 # 1. ALPHABET & HYPERPARAMETERS
 # ---------------------------------------------------------
-# Index 0 is strictly reserved for the CTC "Blank" token.
-# We include lowercase, uppercase, numbers, and space.
-ALPHABET = "<BLANK> abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# Index 0 is the CTC blank token (single placeholder char '~', never printed).
+# Real characters start at index 1.  Total classes = 64.
+#
+# BUG NOTE: the old string "<BLANK> abc..." treated <BLANK> as 7 individual
+# characters, inflating NUM_CLASSES to 70 and putting junk neurons at indices
+# 1-6 that the model could accidentally fire.
+ALPHABET = "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CHAR_TO_IDX = {char: idx for idx, char in enumerate(ALPHABET)}
 IDX_TO_CHAR = {idx: char for idx, char in enumerate(ALPHABET)}
 
 INPUT_FEATURES = 3  # (x, y, accel_z)
 HIDDEN_SIZE = 128  # Brain capacity
 NUM_LAYERS = 2  # Stacked LSTMs
-NUM_CLASSES = len(ALPHABET)
+NUM_CLASSES = len(ALPHABET)  # 64
 
 
 # ---------------------------------------------------------
@@ -121,12 +125,16 @@ def train_and_export():
 
     model = SmartPenDecoder(feat_mean, feat_std)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Halve LR whenever loss plateaus for 10 epochs straight
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, verbose=True
+    )
 
     # CTC Loss is the magic that allows continuous variable-length reading
     ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
 
     model.train()
-    epochs = 150  # More epochs — CTC needs loss well below 0.1 to decode reliably
+    epochs = 150  # CTC needs loss well below 0.1 to decode reliably
 
     indices = list(range(len(X_train)))
 
@@ -157,8 +165,11 @@ def train_and_export():
             optimizer.step()
             total_loss += loss.item()
 
+        avg_loss = total_loss / len(X_train)
+        scheduler.step(avg_loss)  # Adjust LR if stuck on a plateau
+
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(X_train):.4f}")
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
     # ---------------------------------------------------------
     # 5. ONNX EXPORT FOR C++
