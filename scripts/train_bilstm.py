@@ -54,6 +54,7 @@ EPOCHS         = 500
 BATCH_SIZE     = 64   # 128 OOMs on Arc 530M (shared LPDDR5); use 32 if still OOM
 WARMUP_EPOCHS  = 20   # Linear LR warm-up before cosine decay
 BASE_LR        = 3e-4
+PATIENCE       = 50   # Stop if best loss doesn't improve for this many epochs
 
 
 # ---------------------------------------------------------
@@ -226,10 +227,11 @@ def train_and_export():
     # Targets stay on CPU — CTCLoss backward requires CPU target indices.
     # We only transfer the padded input and lengths to the device.
 
-    indices   = list(range(n))
-    best_loss = float("inf")
-    n_batches = math.ceil(n / BATCH_SIZE)
-    bar_width = 30
+    indices        = list(range(n))
+    best_loss      = float("inf")
+    best_weights   = None          # saved state_dict at the best epoch
+    no_improve     = 0             # epochs since best_loss last improved
+    bar_width      = 30
 
     model.train()
     try:
@@ -288,21 +290,36 @@ def train_and_export():
 
             avg_loss = total_loss / n
             if avg_loss < best_loss:
-                best_loss = avg_loss
+                best_loss    = avg_loss
+                best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                no_improve   = 0
+            else:
+                no_improve += 1
 
             # Move to new line and print the epoch summary
+            stop_marker = f"  [no improvement {no_improve}/{PATIENCE}]" if no_improve > 0 else ""
             print(
                 f"\rEpoch {epoch+1:>4}/{EPOCHS}  "
                 f"loss={avg_loss:.4f}  best={best_loss:.4f}  lr={lr:.2e}"
-                + " " * 10  # clear any leftover bar characters
+                + stop_marker
+                + " " * 5
             )
+
+            # Early stopping: plateau detected
+            if no_improve >= PATIENCE:
+                print(f"\n[Early stop] No improvement for {PATIENCE} epochs. Best loss: {best_loss:.4f}")
+                break
 
     except KeyboardInterrupt:
         print(f"\n\n[Interrupted] ", end="")
-        if best_loss == float("inf"):
+        if best_weights is None:
             print("No epoch completed — nothing to export. Re-run and let at least 1 epoch finish.")
             return
         print(f"Exporting model at best loss {best_loss:.4f} ...")
+
+    # Restore the best weights before exporting (guards against loss rising back up)
+    if best_weights is not None:
+        model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
 
     # ---------------------------------------------------------
     # 6. ONNX EXPORT FOR C++
