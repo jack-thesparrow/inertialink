@@ -3,10 +3,11 @@ import os
 import glob
 import random
 import math
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 import pandas as pd
 import numpy as np
 
@@ -58,10 +59,15 @@ class SmartPenDecoder(nn.Module):
         # Bi-LSTM outputs 2x hidden size
         self.fc = nn.Linear(HIDDEN_SIZE * 2, NUM_CLASSES)
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         # x shape: (Batch, Seq_Len, Features) — raw values from C++
         x = (x - self.input_mean) / (self.input_std + 1e-8)
-        lstm_out, _ = self.lstm(x)
+        if lengths is not None:
+            packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            packed_out, _ = self.lstm(packed)
+            lstm_out, _ = pad_packed_sequence(packed_out, batch_first=True)
+        else:
+            lstm_out, _ = self.lstm(x)
         logits = self.fc(lstm_out)
         # logits shape: (Batch, Seq_Len, Num_Classes)
         return logits
@@ -154,8 +160,6 @@ def train_and_export():
     n_batches = math.ceil(n / BATCH_SIZE)
     bar_width = 30
 
-    import sys, time
-
     model.train()
     try:
         for epoch in range(EPOCHS):
@@ -168,36 +172,40 @@ def train_and_export():
             batch_count = 0
             random.shuffle(indices)
 
-            # --- Mini-batch loop with in-line progress bar ---
+            # --- True mini-batch loop: all samples in a batch run in parallel ---
             for batch_start in range(0, n, BATCH_SIZE):
                 batch_idx = indices[batch_start : batch_start + BATCH_SIZE]
 
+                # Collect variable-length sequences for this batch
+                xs = [X_train[i] for i in batch_idx]
+                ys = [Y_train[i] for i in batch_idx]
+
+                # Pad sequences to the longest in the batch: (B, T_max, F)
+                lengths = torch.tensor([x.size(0) for x in xs], dtype=torch.long)
+                x_pad   = pad_sequence(xs, batch_first=True)   # (B, T_max, F)
+
+                # Concatenate all targets into a flat 1-D tensor for CTCLoss
+                targets        = torch.cat(ys)
+                target_lengths = torch.tensor([y.size(0) for y in ys], dtype=torch.long)
+
                 optimizer.zero_grad()
-                batch_loss = 0.0
 
-                for i in batch_idx:
-                    x, y = X_train[i], Y_train[i]
+                # Single forward pass for the whole batch
+                logits = model(x_pad, lengths)          # (B, T_max, C)
+                logits_ctc = logits.permute(1, 0, 2)   # (T_max, B, C) — CTC expects this
 
-                    # Add Batch Dimension: (Seq_Len, 3) -> (1, Seq_Len, 3)
-                    x_batched = x.unsqueeze(0)
-                    logits = model(x_batched)
+                loss = ctc_loss(
+                    logits_ctc.log_softmax(2),
+                    targets,
+                    lengths,
+                    target_lengths,
+                )
 
-                    # CTC Loss expects: (Seq_Len, Batch, Num_Classes)
-                    logits_ctc = logits.transpose(0, 1)
-
-                    input_lengths  = torch.tensor([logits_ctc.size(0)], dtype=torch.long)
-                    target_lengths = torch.tensor([y.size(0)],          dtype=torch.long)
-
-                    loss = ctc_loss(
-                        logits_ctc.log_softmax(2), y, input_lengths, target_lengths
-                    )
-                    batch_loss += loss
-
-                # Average the loss over the mini-batch then back-prop once
-                (batch_loss / len(batch_idx)).backward()
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
-                total_loss  += batch_loss.item()
+
+                total_loss  += loss.item() * len(batch_idx)
                 batch_count += 1
 
                 # Overwrite same line with a mini progress bar
