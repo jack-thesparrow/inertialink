@@ -51,7 +51,7 @@ NUM_LAYERS     = 3    # 3 stacked BiLSTM layers
 NUM_CLASSES    = len(ALPHABET)  # 64
 
 EPOCHS         = 500
-BATCH_SIZE     = 64   # Larger batches keep the GPU fed; reduce if you hit OOM
+BATCH_SIZE     = 128  # Bigger batches = more sustained GPU work per call
 WARMUP_EPOCHS  = 20   # Linear LR warm-up before cosine decay
 BASE_LR        = 3e-4
 
@@ -139,7 +139,31 @@ def load_dataset(data_dir="data"):
 
 
 # ---------------------------------------------------------
-# 4. LR SCHEDULE
+# 4. BATCH PRE-BUILDER
+# ---------------------------------------------------------
+def build_batches(X_train, Y_train, indices, batch_size):
+    """Pre-assemble all padded batches for one epoch.
+
+    Runs once in Python before each epoch so there is zero Python
+    overhead *between* GPU kernel launches during the actual training
+    loop — the GPU gets a new pre-built tensor immediately after each
+    optimizer step.
+    """
+    batches = []
+    for start in range(0, len(indices), batch_size):
+        idx = indices[start : start + batch_size]
+        xs  = [X_train[i] for i in idx]
+        ys  = [Y_train[i] for i in idx]
+        lengths        = torch.tensor([x.size(0) for x in xs], dtype=torch.long)
+        x_pad          = pad_sequence(xs, batch_first=True)        # on DEVICE already
+        targets        = torch.cat(ys)                              # CPU
+        target_lengths = torch.tensor([y.size(0) for y in ys], dtype=torch.long)
+        batches.append((x_pad, lengths, targets, target_lengths))
+    return batches
+
+
+# ---------------------------------------------------------
+# 5. LR SCHEDULE
 # ---------------------------------------------------------
 def get_lr(epoch: int, total_epochs: int, warmup: int, base_lr: float) -> float:
     """Linear warm-up then cosine annealing to 5 % of base_lr."""
@@ -216,34 +240,22 @@ def train_and_export():
                 pg["lr"] = lr
 
             total_loss  = 0.0
-            batch_count = 0
             random.shuffle(indices)
 
-            # --- True mini-batch loop: all samples in a batch run in parallel ---
-            for batch_start in range(0, n, BATCH_SIZE):
-                batch_idx = indices[batch_start : batch_start + BATCH_SIZE]
+            # Pre-build all batches for this epoch in one Python pass.
+            # The training loop below then does pure GPU work with no
+            # Python list/tensor construction between kernel launches.
+            batches     = build_batches(X_train, Y_train, indices, BATCH_SIZE)
+            n_batches   = len(batches)
+            batch_count = 0
 
-                # Collect variable-length sequences for this batch
-                # xs are already on DEVICE (pre-moved at startup)
-                xs = [X_train[i] for i in batch_idx]
-                ys = [Y_train[i] for i in batch_idx]
-
-                # Pad sequences on-device: no CPU→GPU transfer per batch
-                lengths = torch.tensor([x.size(0) for x in xs], dtype=torch.long)
-                x_pad   = pad_sequence(xs, batch_first=True)  # stays on DEVICE
-
-                # Targets on CPU — CTCLoss requires CPU target indices
-                targets        = torch.cat(ys)
-                target_lengths = torch.tensor([y.size(0) for y in ys], dtype=torch.long)
-
+            for x_pad, lengths, targets, target_lengths in batches:
                 optimizer.zero_grad()
 
-                # Forward pass fully on DEVICE
                 logits     = model(x_pad, lengths)       # (B, T_max, C)
                 logits_ctc = logits.permute(1, 0, 2)     # (T_max, B, C)
 
                 if _ctc_native:
-                    # CTCLoss runs on-device — zero GPU stalls
                     loss = ctc_loss(
                         logits_ctc.log_softmax(2),
                         targets.to(DEVICE),
@@ -251,7 +263,6 @@ def train_and_export():
                         target_lengths.to(DEVICE),
                     )
                 else:
-                    # Transfer logits to CPU; gradient flows back through copy op
                     loss = ctc_loss(
                         logits_ctc.cpu().log_softmax(2),
                         targets,
@@ -263,10 +274,9 @@ def train_and_export():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
-                total_loss  += loss.item() * len(batch_idx)
+                total_loss  += loss.item() * x_pad.size(0)
                 batch_count += 1
 
-                # Overwrite same line with a mini progress bar
                 filled = int(bar_width * batch_count / n_batches)
                 bar    = "#" * filled + "-" * (bar_width - filled)
                 sys.stdout.write(
