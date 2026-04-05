@@ -57,20 +57,18 @@ int main(int argc, char *argv[]) {
   }
 
   std::string label = argv[1];
-  std::string mode = (argc > 2) ? argv[2] : "sim";
+  std::string mode = (argc > 2) ? argv[2] : "wifi";
   std::string baseDir = "data/" + label;
   if (!fs::exists(baseDir))
     fs::create_directories(baseDir);
 
   pen::PenBackend backend;
   if (mode == "usb")
-    backend.connectUSB("/dev/ttyUSB0");
+    backend.connectUSB(pen::Defaults::usbPort);
   else if (mode == "bt")
-    backend.connectBluetooth("/dev/rfcomm0");
-  else if (mode == "wifi")
-    backend.connectWiFi(5005);
+    backend.connectBluetooth(pen::Defaults::bluetoothPort);
   else
-    backend.connectUSB("/tmp/vtty_laptop");
+    backend.connectWiFi(pen::Defaults::wifiPort);
 
   std::cout << "\n=== Smart Pen Autonomous Collector ===\n";
   std::cout << "Target: " << label << " | Mode: " << backend.getStatus()
