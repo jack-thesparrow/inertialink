@@ -149,8 +149,12 @@ def train_and_export():
     print(f"Training for {EPOCHS} epochs, batch size {BATCH_SIZE}.")
     print("-" * 60)
 
-    indices = list(range(n))
+    indices   = list(range(n))
     best_loss = float("inf")
+    n_batches = math.ceil(n / BATCH_SIZE)
+    bar_width = 30
+
+    import sys, time
 
     model.train()
     for epoch in range(EPOCHS):
@@ -159,10 +163,11 @@ def train_and_export():
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        total_loss = 0.0
+        total_loss  = 0.0
+        batch_count = 0
         random.shuffle(indices)
 
-        # --- Mini-batch loop ---
+        # --- Mini-batch loop with in-line progress bar ---
         for batch_start in range(0, n, BATCH_SIZE):
             batch_idx = indices[batch_start : batch_start + BATCH_SIZE]
 
@@ -191,19 +196,29 @@ def train_and_export():
             (batch_loss / len(batch_idx)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            total_loss += batch_loss.item()
+            total_loss  += batch_loss.item()
+            batch_count += 1
+
+            # Overwrite same line with a mini progress bar
+            filled = int(bar_width * batch_count / n_batches)
+            bar    = "#" * filled + "-" * (bar_width - filled)
+            sys.stdout.write(
+                f"\rEpoch {epoch+1:>4}/{EPOCHS}  [{bar}]  "
+                f"batch {batch_count}/{n_batches}  "
+                f"lr={lr:.2e}"
+            )
+            sys.stdout.flush()
 
         avg_loss = total_loss / n
         if avg_loss < best_loss:
             best_loss = avg_loss
 
-        if (epoch + 1) % 10 == 0:
-            print(
-                f"Epoch {epoch+1:>4}/{EPOCHS} | "
-                f"Loss: {avg_loss:.4f} | "
-                f"Best: {best_loss:.4f} | "
-                f"LR: {lr:.6f}"
-            )
+        # Move to new line and print the epoch summary
+        print(
+            f"\rEpoch {epoch+1:>4}/{EPOCHS}  "
+            f"loss={avg_loss:.4f}  best={best_loss:.4f}  lr={lr:.2e}"
+            + " " * 10  # clear any leftover bar characters
+        )
 
     # ---------------------------------------------------------
     # 6. ONNX EXPORT FOR C++
