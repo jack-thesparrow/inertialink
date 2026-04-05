@@ -126,13 +126,15 @@ int main(int argc, char *argv[]) {
   }
 
   // --- 2. INITIALIZE HARDWARE BACKEND ---
+  // Port/address defaults live in pen::Defaults so the UI can reference them
+  // too — nothing is hardcoded here.
   pen::PenBackend backend;
   if (mode == "usb")
-    backend.connectUSB("/dev/ttyUSB0");
-  else if (mode == "wifi")
-    backend.connectWiFi(5005);
-  else
-    backend.connectUSB("/tmp/vtty_laptop");
+    backend.connectUSB(pen::Defaults::usbPort);
+  else if (mode == "bt")
+    backend.connectBluetooth(pen::Defaults::bluetoothPort);
+  else // "wifi" (default) — matches mock_esp32.py
+    backend.connectWiFi(pen::Defaults::wifiPort);
 
   std::cout << "Mode: " << backend.getStatus() << "\n";
   std::cout << "--------------------------------\n";

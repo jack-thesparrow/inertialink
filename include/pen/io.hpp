@@ -4,17 +4,28 @@
 
 namespace pen {
 
+// Connection mode — use this in the UI to drive PenBackend::connect*().
+enum class ConnectionMode { None, USB, Bluetooth, WiFi };
+
+// Default port/address values.  Reference these in the UI so nothing is
+// hardcoded in the app layer; override by passing explicit args to connect*().
+struct Defaults {
+  static constexpr const char *usbPort       = "/dev/ttyUSB0";
+  static constexpr const char *bluetoothPort = "/dev/rfcomm0";
+  static constexpr int         wifiPort      = 5005;
+};
+
 struct IMUData {
   float pitch = 0.0f;
   float roll = 0.0f;
   float yaw = 0.0f;
-  float accel_z = 0.0f; // NEW: The shockwave sensor for pen-lift!
+  float accel_z = 0.0f;
 };
 
 // --- SIGNAL PROCESSING: LOW-PASS FILTER ---
 class IMUFilter {
 public:
-  IMUFilter(float alpha = 0.2f); // 0.2 is the sweet spot for IMU smoothing
+  IMUFilter(float alpha = 0.2f);
   IMUData process(const IMUData &raw);
   void reset();
   void setAlpha(float newAlpha);
@@ -62,24 +73,27 @@ private:
   bool active;
 };
 
-// --- THE TUI CONTROLLER ---
+// --- BACKEND CONTROLLER ---
+// The UI calls connect*() to switch modes at runtime; getMode() lets the UI
+// reflect the current state without keeping its own copy.
 class PenBackend {
 public:
   bool getLatestData(IMUData &data);
   std::string getStatus() const;
+  ConnectionMode getMode() const { return currentMode; }
 
-  void connectUSB(const std::string &port = "/dev/ttyUSB0");
-  void connectBluetooth(const std::string &port = "/dev/rfcomm0");
-  void connectWiFi(int listenPort = 5005);
+  void connectUSB(const std::string &port = Defaults::usbPort);
+  void connectBluetooth(const std::string &port = Defaults::bluetoothPort);
+  void connectWiFi(int listenPort = Defaults::wifiPort);
   void disconnect();
 
-  // Allow the future UI to adjust smoothing on the fly!
   void setSmoothing(float alpha) { filter.setAlpha(alpha); }
 
 private:
   std::unique_ptr<IMUReader> activeReader;
-  IMUFilter filter; // The backend now owns a filter
-  std::string currentStatus = "Disconnected";
+  IMUFilter filter;
+  ConnectionMode currentMode = ConnectionMode::None;
+  std::string currentStatus  = "Disconnected";
 };
 
 } // namespace pen
