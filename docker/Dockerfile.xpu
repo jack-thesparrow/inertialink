@@ -1,0 +1,30 @@
+# ============================================================
+# InertiaLink — Intel Arc GPU (XPU) Training Container
+# Base: Intel's official IPEX 2.8.10 image (Ubuntu 22.04)
+#       Includes: PyTorch 2.8, intel-extension-for-pytorch, Level Zero
+# ============================================================
+FROM intel/intel-extension-for-pytorch:2.8.10-xpu
+
+WORKDIR /workspace
+
+# Install project Python dependencies.
+# torch / ipex / numpy are already in the base image — skip them here
+# to avoid version conflicts.
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+        pandas \
+        onnx \
+        onnxruntime \
+        onnxscript \
+        scipy \
+        scikit-learn \
+        matplotlib \
+        tabulate
+
+# Copy the full project so scripts can import each other and reach data/
+COPY . .
+
+# Default command: run the training script.
+# Override at runtime, e.g.:
+#   docker run ... inertialink-xpu python scripts/generate_synthetic_data.py
+CMD ["python", "scripts/train_bilstm.py"]
