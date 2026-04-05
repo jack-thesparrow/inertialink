@@ -11,6 +11,29 @@ from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_se
 import pandas as pd
 import numpy as np
 
+
+# ---------------------------------------------------------
+# 0. DEVICE SELECTION
+#    Priority: Intel Arc (XPU) → NVIDIA (CUDA) → CPU
+#    Install Intel support:  pip install intel-extension-for-pytorch
+# ---------------------------------------------------------
+def get_device() -> torch.device:
+    # Intel Arc / Intel Data Center GPU via IPEX
+    try:
+        import intel_extension_for_pytorch as ipex  # noqa: F401
+        if torch.xpu.is_available():
+            return torch.device("xpu")
+    except ImportError:
+        pass
+    # NVIDIA GPU
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    # CPU fallback
+    return torch.device("cpu")
+
+
+DEVICE = get_device()
+
 # ---------------------------------------------------------
 # 1. ALPHABET & HYPERPARAMETERS
 # ---------------------------------------------------------
@@ -131,6 +154,7 @@ def get_lr(epoch: int, total_epochs: int, warmup: int, base_lr: float) -> float:
 # ---------------------------------------------------------
 def train_and_export():
     print("=== Smart Pen CTC Trainer (v2 — 256-unit BiLSTM × 3, cosine LR) ===")
+    print(f"Device: {DEVICE}")
     X_train, Y_train = load_dataset()
 
     if len(X_train) == 0:
@@ -139,15 +163,16 @@ def train_and_export():
     n = len(X_train)
     print(f"Loaded {n} stroke samples.")
 
-    # --- Compute normalization stats from the whole training set ---
+    # --- Compute normalization stats from the whole training set (on CPU) ---
     all_frames = torch.cat(X_train, dim=0)  # (N_total_frames, 3)
     feat_mean  = all_frames.mean(dim=0)     # (3,)
     feat_std   = all_frames.std(dim=0)      # (3,)
     print(f"Feature mean: {feat_mean.tolist()}")
     print(f"Feature std:  {feat_std.tolist()}")
 
-    model     = SmartPenDecoder(feat_mean, feat_std)
+    model     = SmartPenDecoder(feat_mean, feat_std).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=BASE_LR, weight_decay=1e-5)
+    # CTCLoss must stay on CPU — its CUDA/XPU kernel is unreliable across versions
     ctc_loss  = nn.CTCLoss(blank=0, zero_infinity=True)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -182,17 +207,17 @@ def train_and_export():
 
                 # Pad sequences to the longest in the batch: (B, T_max, F)
                 lengths = torch.tensor([x.size(0) for x in xs], dtype=torch.long)
-                x_pad   = pad_sequence(xs, batch_first=True)   # (B, T_max, F)
+                x_pad   = pad_sequence(xs, batch_first=True).to(DEVICE)  # (B, T_max, F)
 
-                # Concatenate all targets into a flat 1-D tensor for CTCLoss
+                # Targets stay on CPU — CTCLoss requires CPU targets
                 targets        = torch.cat(ys)
                 target_lengths = torch.tensor([y.size(0) for y in ys], dtype=torch.long)
 
                 optimizer.zero_grad()
 
-                # Single forward pass for the whole batch
-                logits = model(x_pad, lengths)          # (B, T_max, C)
-                logits_ctc = logits.permute(1, 0, 2)   # (T_max, B, C) — CTC expects this
+                # Single forward pass for the whole batch (on GPU/XPU/CPU)
+                logits = model(x_pad, lengths)                  # (B, T_max, C)
+                logits_ctc = logits.permute(1, 0, 2).cpu()     # CTCLoss needs CPU
 
                 loss = ctc_loss(
                     logits_ctc.log_softmax(2),
