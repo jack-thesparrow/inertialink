@@ -19,11 +19,13 @@ import numpy as np
 # ---------------------------------------------------------
 def get_device() -> torch.device:
     # Intel Arc / Intel Data Center GPU via IPEX
+    # Requires: pip install intel-extension-for-pytorch (version must match PyTorch)
     try:
         import intel_extension_for_pytorch as ipex  # noqa: F401
         if torch.xpu.is_available():
             return torch.device("xpu")
-    except ImportError:
+    except Exception:
+        # IPEX not installed, wrong version, or broken — silently skip
         pass
     # NVIDIA GPU
     if torch.cuda.is_available():
