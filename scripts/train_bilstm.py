@@ -2,6 +2,7 @@
 import os
 import glob
 import random
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,18 +15,19 @@ import numpy as np
 # ---------------------------------------------------------
 # Index 0 is the CTC blank token (single placeholder char '~', never printed).
 # Real characters start at index 1.  Total classes = 64.
-#
-# BUG NOTE: the old string "<BLANK> abc..." treated <BLANK> as 7 individual
-# characters, inflating NUM_CLASSES to 70 and putting junk neurons at indices
-# 1-6 that the model could accidentally fire.
 ALPHABET = "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 CHAR_TO_IDX = {char: idx for idx, char in enumerate(ALPHABET)}
 IDX_TO_CHAR = {idx: char for idx, char in enumerate(ALPHABET)}
 
-INPUT_FEATURES = 3  # (x, y, accel_z)
-HIDDEN_SIZE = 128  # Brain capacity
-NUM_LAYERS = 2  # Stacked LSTMs
-NUM_CLASSES = len(ALPHABET)  # 64
+INPUT_FEATURES = 3   # (x, y, accel_z)
+HIDDEN_SIZE    = 256  # Doubled from 128 — more capacity for 12 words
+NUM_LAYERS     = 3    # 3 stacked BiLSTM layers
+NUM_CLASSES    = len(ALPHABET)  # 64
+
+EPOCHS         = 500
+BATCH_SIZE     = 16   # Mini-batch gradient descent
+WARMUP_EPOCHS  = 20   # Linear LR warm-up before cosine decay
+BASE_LR        = 3e-4
 
 
 # ---------------------------------------------------------
@@ -51,7 +53,7 @@ class SmartPenDecoder(nn.Module):
             num_layers=NUM_LAYERS,
             batch_first=True,
             bidirectional=True,
-            dropout=0.2,
+            dropout=0.3,
         )
         # Bi-LSTM outputs 2x hidden size
         self.fc = nn.Linear(HIDDEN_SIZE * 2, NUM_CLASSES)
@@ -74,15 +76,19 @@ def load_dataset(data_dir="data"):
     targets = []
 
     if not os.path.exists(data_dir):
-        print(f"[Error] Directory '{data_dir}' not found! Collect data via C++ first.")
+        print(f"[Error] Directory '{data_dir}' not found! Run generate_synthetic_data.py first.")
         return sequences, targets
 
-    for label_folder in os.listdir(data_dir):
+    for label_folder in sorted(os.listdir(data_dir)):
         folder_path = os.path.join(data_dir, label_folder)
         if not os.path.isdir(folder_path):
             continue
 
-        for csv_file in glob.glob(f"{folder_path}/*.csv"):
+        csv_files = glob.glob(f"{folder_path}/*.csv")
+        if not csv_files:
+            continue
+
+        for csv_file in csv_files:
             df = pd.read_csv(csv_file)
 
             # Extract the 3 physical features (Skip timestamp)
@@ -90,7 +96,7 @@ def load_dataset(data_dir="data"):
                 df[["x", "y", "accel_z"]].values, dtype=torch.float32
             )
 
-            # Convert the folder name (e.g., "Hello123") into target IDs
+            # Convert the folder name (e.g., "hello") into target IDs
             target_ids = [
                 CHAR_TO_IDX[char] for char in label_folder if char in CHAR_TO_IDX
             ]
@@ -102,77 +108,105 @@ def load_dataset(data_dir="data"):
 
 
 # ---------------------------------------------------------
-# 4. TRAINING LOOP
+# 4. LR SCHEDULE
+# ---------------------------------------------------------
+def get_lr(epoch: int, total_epochs: int, warmup: int, base_lr: float) -> float:
+    """Linear warm-up then cosine annealing to 5 % of base_lr."""
+    if epoch < warmup:
+        return base_lr * (epoch + 1) / warmup
+    progress = (epoch - warmup) / max(1, total_epochs - warmup)
+    cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
+    min_lr   = base_lr * 0.05
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+# ---------------------------------------------------------
+# 5. TRAINING LOOP
 # ---------------------------------------------------------
 def train_and_export():
-    print("=== Smart Pen CTC Trainer ===")
+    print("=== Smart Pen CTC Trainer (v2 — 256-unit BiLSTM × 3, cosine LR) ===")
     X_train, Y_train = load_dataset()
 
     if len(X_train) == 0:
         return
 
-    print(f"Loaded {len(X_train)} stroke samples.")
+    n = len(X_train)
+    print(f"Loaded {n} stroke samples.")
 
     # --- Compute normalization stats from the whole training set ---
-    # Stack all frames to get a (TotalFrames, 3) tensor, then take mean/std
-    # per feature.  These stats are baked into the model so C++ sends raw
-    # values and the ONNX graph normalizes them internally.
     all_frames = torch.cat(X_train, dim=0)  # (N_total_frames, 3)
-    feat_mean = all_frames.mean(dim=0)      # (3,)
-    feat_std  = all_frames.std(dim=0)       # (3,)
+    feat_mean  = all_frames.mean(dim=0)     # (3,)
+    feat_std   = all_frames.std(dim=0)      # (3,)
     print(f"Feature mean: {feat_mean.tolist()}")
     print(f"Feature std:  {feat_std.tolist()}")
 
-    model = SmartPenDecoder(feat_mean, feat_std)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    # Halve LR whenever loss plateaus for 10 epochs straight
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10
-    )
+    model     = SmartPenDecoder(feat_mean, feat_std)
+    optimizer = optim.Adam(model.parameters(), lr=BASE_LR, weight_decay=1e-5)
+    ctc_loss  = nn.CTCLoss(blank=0, zero_infinity=True)
 
-    # CTC Loss is the magic that allows continuous variable-length reading
-    ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,}")
+    print(f"Training for {EPOCHS} epochs, batch size {BATCH_SIZE}.")
+    print("-" * 60)
+
+    indices = list(range(n))
+    best_loss = float("inf")
 
     model.train()
-    epochs = 150  # CTC needs loss well below 0.1 to decode reliably
+    for epoch in range(EPOCHS):
+        # --- Set LR manually (warm-up + cosine) ---
+        lr = get_lr(epoch, EPOCHS, WARMUP_EPOCHS, BASE_LR)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
 
-    indices = list(range(len(X_train)))
-
-    for epoch in range(epochs):
-        total_loss = 0
-
-        # Shuffle each epoch so the model learns the signal, not the order
+        total_loss = 0.0
         random.shuffle(indices)
 
-        for i in indices:
-            x, y = X_train[i], Y_train[i]
+        # --- Mini-batch loop ---
+        for batch_start in range(0, n, BATCH_SIZE):
+            batch_idx = indices[batch_start : batch_start + BATCH_SIZE]
+
             optimizer.zero_grad()
+            batch_loss = 0.0
 
-            # Add Batch Dimension: (Seq_Len, 3) -> (1, Seq_Len, 3)
-            x_batched = x.unsqueeze(0)
-            logits = model(x_batched)
+            for i in batch_idx:
+                x, y = X_train[i], Y_train[i]
 
-            # CTC Loss expects: (Seq_Len, Batch, Num_Classes)
-            logits_ctc = logits.transpose(0, 1)
+                # Add Batch Dimension: (Seq_Len, 3) -> (1, Seq_Len, 3)
+                x_batched = x.unsqueeze(0)
+                logits = model(x_batched)
 
-            input_lengths = torch.tensor([logits_ctc.size(0)], dtype=torch.long)
-            target_lengths = torch.tensor([y.size(0)], dtype=torch.long)
+                # CTC Loss expects: (Seq_Len, Batch, Num_Classes)
+                logits_ctc = logits.transpose(0, 1)
 
-            loss = ctc_loss(logits_ctc.log_softmax(2), y, input_lengths, target_lengths)
-            loss.backward()
-            # Gradient clipping — LSTMs blow up without it
+                input_lengths  = torch.tensor([logits_ctc.size(0)], dtype=torch.long)
+                target_lengths = torch.tensor([y.size(0)],          dtype=torch.long)
+
+                loss = ctc_loss(
+                    logits_ctc.log_softmax(2), y, input_lengths, target_lengths
+                )
+                batch_loss += loss
+
+            # Average the loss over the mini-batch then back-prop once
+            (batch_loss / len(batch_idx)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += batch_loss.item()
 
-        avg_loss = total_loss / len(X_train)
-        scheduler.step(avg_loss)  # Adjust LR if stuck on a plateau
+        avg_loss = total_loss / n
+        if avg_loss < best_loss:
+            best_loss = avg_loss
 
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(
+                f"Epoch {epoch+1:>4}/{EPOCHS} | "
+                f"Loss: {avg_loss:.4f} | "
+                f"Best: {best_loss:.4f} | "
+                f"LR: {lr:.6f}"
+            )
 
     # ---------------------------------------------------------
-    # 5. ONNX EXPORT FOR C++
+    # 6. ONNX EXPORT FOR C++
     # ---------------------------------------------------------
     import warnings
     import onnx
@@ -198,19 +232,18 @@ def train_and_export():
         input_names=["input_stroke"],
         output_names=["predicted_logits"],
         dynamic_axes={
-            "input_stroke":    {1: "seq_len"},
+            "input_stroke":     {1: "seq_len"},
             "predicted_logits": {1: "seq_len"},
         },
     )
 
-    # --- THE MAGIC FIX FOR C++ ---
-    # PyTorch's exporter is too modern for your C++ system library.
-    # We will manually downgrade the internal file version so C++ can read it.
+    # Downgrade IR version so the C++ system ONNX Runtime library can read it.
     onnx_model = onnx.load(onnx_path)
     onnx_model.ir_version = 9
     onnx.save(onnx_model, onnx_path)
 
     print(f"\n[SUCCESS] AI Brain exported to: {onnx_path} (IR Version 9)")
+    print(f"Final training loss: {best_loss:.4f}")
     print("The C++ decoder is now ready to receive this brain.")
 
 
