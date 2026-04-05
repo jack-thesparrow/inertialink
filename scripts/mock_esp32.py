@@ -36,6 +36,9 @@ def stream_csv(filepath):
 
         time.sleep(0.01)  # 10ms = 100Hz hardware speed
 
+    # Return the last row so the caller can use its position for idle frames
+    return df.iloc[-1]
+
 
 if __name__ == "__main__":
     # Let's test the AI by sending it the word "hello"
@@ -51,13 +54,23 @@ if __name__ == "__main__":
             sock.sendto(b"0.0,0.0,0.0,0.0\n", (UDP_IP, UDP_PORT))
             time.sleep(0.01)
 
-        # 2. Stream the actual stroke!
-        stream_csv(sample_file)
+        # 2. Stream the actual stroke; get final pen position
+        last_row = stream_csv(sample_file)
 
-        # 3. Send idle data so the C++ triggers the 2-second timeout
+        # 3. Send the pen's FINAL RESTING POSITION as idle data.
+        #
+        # Why not zeros: training CSVs were collected by the data_collector which
+        # kept recording for 2 s after the pen lifted — during that time the pen
+        # stayed at the end of the stroke (x ≈ final_x, not x ≈ 0).  Sending
+        # zeros here made the decoder's trailing 200 frames jump back to x ≈ 0,
+        # a pattern the model never saw in training, causing wrong predictions.
+        final_yaw   = math.degrees(-(last_row["x"] / LEVER_ARM_MM))
+        final_pitch = math.degrees( last_row["y"] / LEVER_ARM_MM)
+        idle_msg = f"{final_pitch:.4f},0.0000,{final_yaw:.4f},0.0000\n".encode()
+
         print(f"[Hardware] Pen lifted. Sent: \"{target_word}\" — waiting for AI to process...")
         for _ in range(250):
-            sock.sendto(b"0.0,0.0,0.0,0.0\n", (UDP_IP, UDP_PORT))
+            sock.sendto(idle_msg, (UDP_IP, UDP_PORT))
             time.sleep(0.01)
 
         print("[Hardware] Simulation complete.")
