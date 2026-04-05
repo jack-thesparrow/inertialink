@@ -35,6 +35,11 @@ GROUP_FLAGS=""
 [ -n "$VIDEO_GID"  ] && GROUP_FLAGS="$GROUP_FLAGS --group-add $VIDEO_GID"
 [ -n "$RENDER_GID" ] && GROUP_FLAGS="$GROUP_FLAGS --group-add $RENDER_GID"
 
+# ── Default command if none given ────────────────────────────
+if [ "$#" -eq 0 ]; then
+    set -- python scripts/train_bilstm.py
+fi
+
 # ── Run ──────────────────────────────────────────────────────
 # - Mount project root so generated data/ and models/ land on the host
 # - Pass /dev/dri for GPU access
@@ -48,4 +53,4 @@ docker run --rm -it \
     -v "$PROJECT_DIR":/workspace \
     -w /workspace \
     "$IMAGE_NAME" \
-    "${@:-python scripts/train_bilstm.py}"
+    "$@"
