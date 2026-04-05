@@ -51,7 +51,7 @@ NUM_LAYERS     = 3    # 3 stacked BiLSTM layers
 NUM_CLASSES    = len(ALPHABET)  # 64
 
 EPOCHS         = 500
-BATCH_SIZE     = 16   # Mini-batch gradient descent
+BATCH_SIZE     = 64   # Larger batches keep the GPU fed; reduce if you hit OOM
 WARMUP_EPOCHS  = 20   # Linear LR warm-up before cosine decay
 BASE_LR        = 3e-4
 
@@ -174,13 +174,33 @@ def train_and_export():
 
     model     = SmartPenDecoder(feat_mean, feat_std).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=BASE_LR, weight_decay=1e-5)
-    # CTCLoss must stay on CPU — its CUDA/XPU kernel is unreliable across versions
     ctc_loss  = nn.CTCLoss(blank=0, zero_infinity=True)
+
+    # Test whether CTCLoss runs natively on this device (CUDA yes, XPU maybe).
+    # If it works, logits never leave the device — no GPU stalls.
+    # If it fails, we fall back to .cpu() transfer per batch.
+    _ctc_native = False
+    try:
+        _dummy_log  = torch.zeros(5, 1, NUM_CLASSES, device=DEVICE).log_softmax(2)
+        _dummy_tgt  = torch.tensor([1, 2], dtype=torch.long)
+        _dummy_ilen = torch.tensor([5], dtype=torch.long)
+        _dummy_tlen = torch.tensor([2], dtype=torch.long)
+        ctc_loss(_dummy_log, _dummy_tgt, _dummy_ilen, _dummy_tlen)
+        _ctc_native = True
+        print(f"CTCLoss: running natively on {DEVICE} (no CPU transfers)")
+    except Exception:
+        print(f"CTCLoss: falling back to CPU (XPU kernel unavailable)")
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,}")
     print(f"Training for {EPOCHS} epochs, batch size {BATCH_SIZE}.")
     print("-" * 60)
+
+    # Pre-move all training tensors to the device once at startup.
+    # This eliminates per-batch CPU→GPU transfers that stall the GPU.
+    X_train = [x.to(DEVICE) for x in X_train]
+    # Targets stay on CPU — CTCLoss backward requires CPU target indices.
+    # We only transfer the padded input and lengths to the device.
 
     indices   = list(range(n))
     best_loss = float("inf")
@@ -204,29 +224,40 @@ def train_and_export():
                 batch_idx = indices[batch_start : batch_start + BATCH_SIZE]
 
                 # Collect variable-length sequences for this batch
+                # xs are already on DEVICE (pre-moved at startup)
                 xs = [X_train[i] for i in batch_idx]
                 ys = [Y_train[i] for i in batch_idx]
 
-                # Pad sequences to the longest in the batch: (B, T_max, F)
+                # Pad sequences on-device: no CPU→GPU transfer per batch
                 lengths = torch.tensor([x.size(0) for x in xs], dtype=torch.long)
-                x_pad   = pad_sequence(xs, batch_first=True).to(DEVICE)  # (B, T_max, F)
+                x_pad   = pad_sequence(xs, batch_first=True)  # stays on DEVICE
 
-                # Targets stay on CPU — CTCLoss requires CPU targets
+                # Targets on CPU — CTCLoss requires CPU target indices
                 targets        = torch.cat(ys)
                 target_lengths = torch.tensor([y.size(0) for y in ys], dtype=torch.long)
 
                 optimizer.zero_grad()
 
-                # Single forward pass for the whole batch (on GPU/XPU/CPU)
-                logits = model(x_pad, lengths)                  # (B, T_max, C)
-                logits_ctc = logits.permute(1, 0, 2).cpu()     # CTCLoss needs CPU
+                # Forward pass fully on DEVICE
+                logits     = model(x_pad, lengths)       # (B, T_max, C)
+                logits_ctc = logits.permute(1, 0, 2)     # (T_max, B, C)
 
-                loss = ctc_loss(
-                    logits_ctc.log_softmax(2),
-                    targets,
-                    lengths,
-                    target_lengths,
-                )
+                if _ctc_native:
+                    # CTCLoss runs on-device — zero GPU stalls
+                    loss = ctc_loss(
+                        logits_ctc.log_softmax(2),
+                        targets.to(DEVICE),
+                        lengths.to(DEVICE),
+                        target_lengths.to(DEVICE),
+                    )
+                else:
+                    # Transfer logits to CPU; gradient flows back through copy op
+                    loss = ctc_loss(
+                        logits_ctc.cpu().log_softmax(2),
+                        targets,
+                        lengths,
+                        target_lengths,
+                    )
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
