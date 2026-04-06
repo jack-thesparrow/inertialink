@@ -50,11 +50,13 @@ HIDDEN_SIZE    = 256  # Doubled from 128 — more capacity for 12 words
 NUM_LAYERS     = 3    # 3 stacked BiLSTM layers
 NUM_CLASSES    = len(ALPHABET)  # 64
 
-EPOCHS         = 500
-BATCH_SIZE     = 64   # 128 OOMs on Arc 530M (shared LPDDR5); use 32 if still OOM
-WARMUP_EPOCHS  = 20   # Linear LR warm-up before cosine decay
-BASE_LR        = 3e-4
-PATIENCE       = 50   # Stop if best loss doesn't improve for this many epochs
+EPOCHS             = 500
+BATCH_SIZE         = 64   # 128 OOMs on Arc 530M (shared LPDDR5); use 32 if still OOM
+WARMUP_EPOCHS      = 20   # Linear LR warm-up before cosine decay
+BASE_LR            = 3e-4
+PATIENCE           = 50   # Stop if best loss doesn't improve for this many epochs
+CHECKPOINT_EVERY   = 10   # Save a resume checkpoint every N epochs
+CHECKPOINT_PATH    = "models/checkpoint.pt"
 
 
 # ---------------------------------------------------------
@@ -229,13 +231,27 @@ def train_and_export():
 
     indices        = list(range(n))
     best_loss      = float("inf")
-    best_weights   = None          # saved state_dict at the best epoch
-    no_improve     = 0             # epochs since best_loss last improved
+    best_weights   = None
+    no_improve     = 0
+    start_epoch    = 0
     bar_width      = 30
+
+    # --- Resume from checkpoint if one exists ---
+    os.makedirs("models", exist_ok=True)
+    if os.path.exists(CHECKPOINT_PATH):
+        print(f"[Checkpoint] Resuming from {CHECKPOINT_PATH} ...")
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch  = ckpt["epoch"] + 1
+        best_loss    = ckpt["best_loss"]
+        no_improve   = ckpt["no_improve"]
+        best_weights = ckpt.get("best_weights")
+        print(f"[Checkpoint] Resuming at epoch {start_epoch}, best loss {best_loss:.4f}")
 
     model.train()
     try:
-        for epoch in range(EPOCHS):
+        for epoch in range(start_epoch, EPOCHS):
             # --- Set LR manually (warm-up + cosine) ---
             lr = get_lr(epoch, EPOCHS, WARMUP_EPOCHS, BASE_LR)
             for pg in optimizer.param_groups:
@@ -306,6 +322,17 @@ def train_and_export():
             # Pad to 80 chars so any leftover progress-bar text is overwritten
             print(f"\r{line:<80}")
 
+            # Save checkpoint every N epochs so training can resume after a crash
+            if (epoch + 1) % CHECKPOINT_EVERY == 0:
+                torch.save({
+                    "epoch":        epoch,
+                    "model":        model.state_dict(),
+                    "optimizer":    optimizer.state_dict(),
+                    "best_loss":    best_loss,
+                    "no_improve":   no_improve,
+                    "best_weights": best_weights,
+                }, CHECKPOINT_PATH)
+
             # Early stopping: plateau detected
             if no_improve >= PATIENCE:
                 print(f"\n[Early stop] No improvement for {PATIENCE} epochs. Best loss: {best_loss:.4f}")
@@ -362,6 +389,11 @@ def train_and_export():
     print(f"\n[SUCCESS] AI Brain exported to: {onnx_path} (IR Version 9)")
     print(f"Final training loss: {best_loss:.4f}")
     print("The C++ decoder is now ready to receive this brain.")
+
+    # Remove checkpoint — training is complete, no need to resume
+    if os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
+        print(f"[Checkpoint] Removed {CHECKPOINT_PATH} (training complete)")
 
 
 if __name__ == "__main__":
