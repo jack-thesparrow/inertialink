@@ -309,6 +309,11 @@ def train_and_export():
         best_weights = ckpt.get("best_weights")
         print(f"[Checkpoint] Resuming at epoch {start_epoch}, best loss {best_loss:.4f}")
 
+    # Keep a reference to the raw (uncompiled) model for ONNX export later.
+    # torch.onnx.export uses jit.trace which conflicts with dynamo-compiled models.
+    # We use raw_model only at export time — training always uses the compiled one.
+    raw_model = model
+
     # torch.compile() AFTER checkpoint load — compiling changes key names
     # (_orig_mod. prefix) so the checkpoint must be loaded into the raw model first.
     try:
@@ -451,9 +456,15 @@ def train_and_export():
             return
         print(f"Exporting model at best loss {best_loss:.4f} (checkpoint kept — re-run to continue training) ...")
 
-    # Restore the best weights before exporting (guards against loss rising back up)
+    # Restore best weights into the raw (uncompiled) model for ONNX export.
+    # torch.compile adds an "_orig_mod." prefix to every key in state_dict —
+    # strip it so the weights load cleanly into the original SmartPenDecoder.
     if best_weights is not None:
-        model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
+        clean_weights = {
+            k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
+            for k, v in best_weights.items()
+        }
+        raw_model.load_state_dict({k: v.to(DEVICE) for k, v in clean_weights.items()})
 
     # ---------------------------------------------------------
     # 6. ONNX EXPORT FOR C++
@@ -465,14 +476,16 @@ def train_and_export():
     os.makedirs("models", exist_ok=True)
     onnx_path = "models/pen_model.onnx"
 
-    model.eval()
+    # Use raw_model (not compiled model) — torch.onnx.export uses jit.trace which
+    # crashes on dynamo-optimized (torch.compile'd) models.
+    raw_model.eval()
     dummy_input = torch.randn(1, 150, INPUT_FEATURES)
 
     # Use the legacy TorchScript-based exporter (dynamo=False) with dynamic_axes.
     # The newer dynamo exporter conflicts when the dummy input has a fixed sequence
     # length (150) but the dimension is declared dynamic via Dim objects.
     torch.onnx.export(
-        model,
+        raw_model,
         (dummy_input,),
         onnx_path,
         dynamo=False,
