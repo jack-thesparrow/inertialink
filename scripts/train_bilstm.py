@@ -46,8 +46,8 @@ CHAR_TO_IDX = {char: idx for idx, char in enumerate(ALPHABET)}
 IDX_TO_CHAR = {idx: char for idx, char in enumerate(ALPHABET)}
 
 INPUT_FEATURES = 3   # (x, y, accel_z)
-HIDDEN_SIZE    = 256  # Doubled from 128 — more capacity for 12 words
-NUM_LAYERS     = 3    # 3 stacked BiLSTM layers
+HIDDEN_SIZE    = 128  # Sufficient for 12-word synthetic vocab; ~4x faster than 256
+NUM_LAYERS     = 2    # 2 layers is enough; 3rd layer added marginal accuracy
 NUM_CLASSES    = len(ALPHABET)  # 64
 
 EPOCHS             = 500
