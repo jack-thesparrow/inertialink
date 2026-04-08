@@ -36,6 +36,10 @@ def get_device() -> torch.device:
 
 DEVICE = get_device()
 
+# Use all CPU cores for PyTorch BLAS/MKL operations
+torch.set_num_threads(os.cpu_count())
+torch.set_num_interop_threads(max(1, os.cpu_count() // 2))
+
 # ---------------------------------------------------------
 # 1. ALPHABET & HYPERPARAMETERS
 # ---------------------------------------------------------
@@ -200,6 +204,15 @@ def train_and_export():
     print(f"Feature std:  {feat_std.tolist()}")
 
     model     = SmartPenDecoder(feat_mean, feat_std).to(DEVICE)
+
+    # torch.compile() JIT-compiles the model graph for 20-40% faster CPU execution.
+    # Falls back silently if unsupported (older PyTorch / Windows).
+    try:
+        model = torch.compile(model)
+        print("torch.compile: enabled (faster CPU execution)")
+    except Exception:
+        print("torch.compile: not available, running normally")
+
     optimizer = optim.Adam(model.parameters(), lr=BASE_LR, weight_decay=1e-5)
     ctc_loss  = nn.CTCLoss(blank=0, zero_infinity=True)
 
