@@ -302,21 +302,21 @@ def train_and_export():
         print(f"[Checkpoint] Resuming from {CHECKPOINT_PATH} ...")
         ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
 
-        # Checkpoints saved by a compiled model have "_orig_mod." prefixed keys.
-        # We load into the raw model here (before torch.compile), so strip it.
-        def _strip_orig_mod(sd):
-            return {
-                k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
-                for k, v in sd.items()
-            }
+        # Backward-compat: old checkpoints were saved from a compiled model and
+        # have "_orig_mod." prefixed keys. Strip the prefix so the weights load
+        # into the raw model cleanly. After this run, checkpoints are saved from
+        # raw_model so the strip will be a no-op on every future resume.
+        def _clean(sd):
+            return {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+                    for k, v in sd.items()}
 
-        model.load_state_dict(_strip_orig_mod(ckpt["model"]))
+        model.load_state_dict(_clean(ckpt["model"]))
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch  = ckpt["epoch"] + 1
         best_loss    = ckpt["best_loss"]
         no_improve   = ckpt["no_improve"]
         bw = ckpt.get("best_weights")
-        best_weights = _strip_orig_mod(bw) if bw is not None else None
+        best_weights = _clean(bw) if bw is not None else None
         print(f"[Checkpoint] Resuming at epoch {start_epoch}, best loss {best_loss:.4f}")
 
     # Keep a reference to the raw (uncompiled) model for ONNX export later.
@@ -427,7 +427,9 @@ def train_and_export():
             avg_loss = total_loss / n
             if avg_loss < best_loss:
                 best_loss    = avg_loss
-                best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                # Save from raw_model — keys are always clean (no _orig_mod. prefix)
+                # even though training runs through the compiled wrapper.
+                best_weights = {k: v.cpu().clone() for k, v in raw_model.state_dict().items()}
                 no_improve   = 0
             else:
                 no_improve += 1
@@ -442,11 +444,12 @@ def train_and_export():
             # Pad to 80 chars so any leftover progress-bar text is overwritten
             print(f"\r{line:<80}")
 
-            # Save checkpoint every N epochs so training can resume after a crash
+            # Save checkpoint every N epochs so training can resume after a crash.
+            # Always use raw_model.state_dict() — clean keys, no _orig_mod. prefix.
             if (epoch + 1) % CHECKPOINT_EVERY == 0:
                 torch.save({
                     "epoch":        epoch,
-                    "model":        model.state_dict(),
+                    "model":        raw_model.state_dict(),
                     "optimizer":    optimizer.state_dict(),
                     "best_loss":    best_loss,
                     "no_improve":   no_improve,
@@ -466,15 +469,10 @@ def train_and_export():
             return
         print(f"Exporting model at best loss {best_loss:.4f} (checkpoint kept — re-run to continue training) ...")
 
-    # Restore best weights into the raw (uncompiled) model for ONNX export.
-    # torch.compile adds an "_orig_mod." prefix to every key in state_dict —
-    # strip it so the weights load cleanly into the original SmartPenDecoder.
+    # Restore the best weights seen during training.
+    # best_weights is always saved from raw_model so keys are clean — load directly.
     if best_weights is not None:
-        clean_weights = {
-            k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
-            for k, v in best_weights.items()
-        }
-        raw_model.load_state_dict({k: v.to(DEVICE) for k, v in clean_weights.items()})
+        raw_model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
 
     # ---------------------------------------------------------
     # 6. ONNX EXPORT FOR C++
