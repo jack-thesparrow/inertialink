@@ -11,14 +11,12 @@ int main(int argc, char *argv[]) {
   std::string mode = (argc > 1) ? argv[1] : "sim";
 
   if (mode == "usb") {
-    backend.connectUSB("/dev/ttyUSB0");
+    backend.connectUSB(pen::Defaults::usbPort);
   } else if (mode == "bt") {
-    backend.connectBluetooth("/dev/rfcomm0");
+    backend.connectBluetooth(pen::Defaults::bluetoothPort);
   } else if (mode == "wifi") {
-    backend.connectWiFi(5005);
-  } else {
-    std::cout << "[Visualizer] Defaulting to Simulator mode...\n";
-    // Connects to the virtual cable created by socat!
+    backend.connectWiFi(pen::Defaults::wifiPort);
+  } else { // "sim" — virtual cable created by socat for desktop testing
     backend.connectUSB("/tmp/vtty_laptop");
   }
 

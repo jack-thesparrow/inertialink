@@ -74,14 +74,12 @@ int main(int argc, char *argv[]) {
   std::cout << "Target: " << label << " | Mode: " << backend.getStatus()
             << "\n";
 
-  // --- PHYSICAL TUNING PARAMETERS ---
-  const float LEVER_ARM_MM = 150.0f; // Distance from wrist pivot to pen tip
-  const float WAKE_THRESHOLD_Z =
-      0.5f; // How hard the pen must hit paper to wake up
-  const float ACTIVITY_THRESHOLD =
-      0.02f; // Minimum angular movement (radians) to stay awake
-  const int IDLE_TIMEOUT_MS =
-      2000; // Milliseconds of stillness before auto-saving
+  // Physics constants live in pen::Defaults (io.hpp) so they stay in sync
+  // with decoder_main.cpp and the synthetic data generator.
+  constexpr float LEVER_ARM_MM      = pen::Defaults::leverArmMm;
+  constexpr float WAKE_THRESHOLD_Z  = pen::Defaults::wakeThresholdZ;
+  constexpr float ACTIVITY_THRESHOLD= pen::Defaults::activityThreshold;
+  constexpr int   IDLE_TIMEOUT_MS   = pen::Defaults::idleTimeoutMs;
 
   int sampleCount = 1;
   std::vector<DataPoint> strokeBuffer;

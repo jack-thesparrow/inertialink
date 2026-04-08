@@ -10,6 +10,8 @@
 
 namespace pen {
 
+static constexpr float DEG_TO_RAD = static_cast<float>(M_PI / 180.0);
+
 // ==========================================
 // LOW-PASS FILTER MATH
 // ==========================================
@@ -84,10 +86,10 @@ bool SerialReader::readData(IMUData &data) {
       float p, r, y, az = 0.0f;
       int parsed = sscanf(buffer, "%f,%f,%f,%f", &p, &r, &y, &az);
       if (parsed >= 3) {
-        data.pitch = p * (M_PI / 180.0f);
-        data.roll = r * (M_PI / 180.0f);
-        data.yaw = y * (M_PI / 180.0f);
-        data.accel_z = az; // Captures Z-axis gravity/impact
+        data.pitch   = p * DEG_TO_RAD;
+        data.roll    = r * DEG_TO_RAD;
+        data.yaw     = y * DEG_TO_RAD;
+        data.accel_z = az;
         newDataReady = true;
       }
       bufPos = 0;
@@ -138,9 +140,9 @@ bool UDPReader::readData(IMUData &data) {
     float p, r, y, az = 0.0f;
     int parsed = sscanf(buf, "%f,%f,%f,%f", &p, &r, &y, &az);
     if (parsed >= 3) {
-      data.pitch = p * (M_PI / 180.0f);
-      data.roll = r * (M_PI / 180.0f);
-      data.yaw = y * (M_PI / 180.0f);
+      data.pitch   = p * DEG_TO_RAD;
+      data.roll    = r * DEG_TO_RAD;
+      data.yaw     = y * DEG_TO_RAD;
       data.accel_z = az;
       return true;
     }

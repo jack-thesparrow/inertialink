@@ -14,10 +14,12 @@ struct DataPoint {
   float accel_z;
 };
 
-// Must match train_bilstm.py exactly.  Index 0 ('~') is the CTC blank — it is
-// always skipped by the decoder.  Real characters start at index 1.
-const std::string ALPHABET =
+// Must match train_bilstm.py ALPHABET exactly.
+// Index 0 ('~') is the CTC blank — always skipped by the decoder.
+// Real characters start at index 1.
+static const std::string ALPHABET =
     "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static constexpr const char *MODEL_PATH = "models/pen_model.onnx";
 
 // ---------------------------------------------------------
 // ONNX INFERENCE & CTC DECODER
@@ -116,14 +118,17 @@ int main(int argc, char *argv[]) {
   // We wrap this in a try-catch to get EXACT error messages
   std::unique_ptr<Ort::Session> session;
   try {
-    session = std::make_unique<Ort::Session>(env, "models/pen_model.onnx",
-                                             session_options);
-    std::cout << "[System] AI Model 'pen_model.onnx' loaded successfully.\n";
+    session = std::make_unique<Ort::Session>(env, MODEL_PATH, session_options);
+    std::cout << "[System] AI Model '" << MODEL_PATH << "' loaded successfully.\n";
   } catch (const Ort::Exception &e) {
-    // This will print the actual mathematical or version error if it crashes!
     std::cerr << "\n[FATAL ONNX ERROR] " << e.what() << "\n";
   } catch (...) {
-    std::cerr << "\n[Warning] 'models/pen_model.onnx' not found!\n";
+    std::cerr << "\n[FATAL] '" << MODEL_PATH << "' not found — run train_bilstm.py first.\n";
+  }
+
+  if (!session) {
+    std::cerr << "[FATAL] Cannot run without a model. Exiting.\n";
+    return 1;
   }
 
   // --- 2. INITIALIZE HARDWARE BACKEND ---
@@ -154,11 +159,12 @@ int main(int argc, char *argv[]) {
   std::cout << "Mode: " << backend.getStatus() << "\n";
   std::cout << "--------------------------------\n";
 
-  // --- PHYSICAL TUNING PARAMETERS ---
-  const float LEVER_ARM_MM = 150.0f;
-  const float WAKE_THRESHOLD_Z = 0.5f;
-  const float ACTIVITY_THRESHOLD = 0.02f;
-  const int IDLE_TIMEOUT_MS = 2000;
+  // Physics constants — shared with data_collector via pen::Defaults (io.hpp).
+  // Must match the values used when training data was collected.
+  constexpr float LEVER_ARM_MM       = pen::Defaults::leverArmMm;
+  constexpr float WAKE_THRESHOLD_Z   = pen::Defaults::wakeThresholdZ;
+  constexpr float ACTIVITY_THRESHOLD = pen::Defaults::activityThreshold;
+  constexpr int   IDLE_TIMEOUT_MS    = pen::Defaults::idleTimeoutMs;
 
   std::vector<DataPoint> strokeBuffer;
   strokeBuffer.reserve(5000);
