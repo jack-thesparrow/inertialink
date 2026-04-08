@@ -182,7 +182,7 @@ def get_lr(epoch: int, total_epochs: int, warmup: int, base_lr: float) -> float:
 # 5. TRAINING LOOP
 # ---------------------------------------------------------
 def train_and_export():
-    print("=== Smart Pen CTC Trainer (v2 — 256-unit BiLSTM × 3, cosine LR) ===")
+    print(f"=== Smart Pen CTC Trainer ({HIDDEN_SIZE}-unit BiLSTM × {NUM_LAYERS}, cosine LR) ===")
     print(f"Device: {DEVICE}")
     X_train, Y_train = load_dataset()
 
