@@ -301,12 +301,22 @@ def train_and_export():
     if os.path.exists(CHECKPOINT_PATH):
         print(f"[Checkpoint] Resuming from {CHECKPOINT_PATH} ...")
         ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-        model.load_state_dict(ckpt["model"])
+
+        # Checkpoints saved by a compiled model have "_orig_mod." prefixed keys.
+        # We load into the raw model here (before torch.compile), so strip it.
+        def _strip_orig_mod(sd):
+            return {
+                k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
+                for k, v in sd.items()
+            }
+
+        model.load_state_dict(_strip_orig_mod(ckpt["model"]))
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch  = ckpt["epoch"] + 1
         best_loss    = ckpt["best_loss"]
         no_improve   = ckpt["no_improve"]
-        best_weights = ckpt.get("best_weights")
+        bw = ckpt.get("best_weights")
+        best_weights = _strip_orig_mod(bw) if bw is not None else None
         print(f"[Checkpoint] Resuming at epoch {start_epoch}, best loss {best_loss:.4f}")
 
     # Keep a reference to the raw (uncompiled) model for ONNX export later.
