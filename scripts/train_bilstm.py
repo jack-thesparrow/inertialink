@@ -14,18 +14,25 @@ import numpy as np
 
 # ---------------------------------------------------------
 # 0. DEVICE SELECTION
-#    Priority: Intel Arc (XPU) → NVIDIA (CUDA) → CPU
-#    Install Intel support:  pip install intel-extension-for-pytorch
+#    Priority: Intel Arc native XPU → IPEX XPU → NVIDIA CUDA → CPU
+#
+#    PyTorch 2.4+ has built-in XPU support for Intel Arc — no IPEX needed.
+#    IPEX is tried as a fallback for older PyTorch versions.
+#    Install Intel drivers: https://dgpu-docs.intel.com/driver/installation.html
 # ---------------------------------------------------------
 def get_device() -> torch.device:
-    # Intel Arc / Intel Data Center GPU via IPEX
-    # Requires: pip install intel-extension-for-pytorch (version must match PyTorch)
+    # PyTorch 2.4+ native XPU — works without IPEX on modern Intel Arc drivers
+    try:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return torch.device("xpu")
+    except Exception:
+        pass
+    # Older PyTorch: try IPEX (version must match PyTorch exactly)
     try:
         import intel_extension_for_pytorch as ipex  # noqa: F401
         if torch.xpu.is_available():
             return torch.device("xpu")
     except Exception:
-        # IPEX not installed, wrong version, or broken — silently skip
         pass
     # NVIDIA GPU
     if torch.cuda.is_available():
