@@ -232,9 +232,10 @@ def train_and_export():
     indices        = list(range(n))
     best_loss      = float("inf")
     best_weights   = None
-    no_improve     = 0
-    start_epoch    = 0
-    bar_width      = 30
+    no_improve        = 0
+    start_epoch       = 0
+    bar_width         = 30
+    training_complete = False  # True only on natural finish; False on Ctrl+C
 
     # --- Resume from checkpoint if one exists ---
     os.makedirs("models", exist_ok=True)
@@ -336,6 +337,7 @@ def train_and_export():
             # Early stopping: plateau detected
             if no_improve >= PATIENCE:
                 print(f"\n[Early stop] No improvement for {PATIENCE} epochs. Best loss: {best_loss:.4f}")
+                training_complete = True
                 break
 
     except KeyboardInterrupt:
@@ -343,7 +345,7 @@ def train_and_export():
         if best_weights is None:
             print("No epoch completed — nothing to export. Re-run and let at least 1 epoch finish.")
             return
-        print(f"Exporting model at best loss {best_loss:.4f} ...")
+        print(f"Exporting model at best loss {best_loss:.4f} (checkpoint kept — re-run to continue training) ...")
 
     # Restore the best weights before exporting (guards against loss rising back up)
     if best_weights is not None:
@@ -390,8 +392,9 @@ def train_and_export():
     print(f"Final training loss: {best_loss:.4f}")
     print("The C++ decoder is now ready to receive this brain.")
 
-    # Remove checkpoint — training is complete, no need to resume
-    if os.path.exists(CHECKPOINT_PATH):
+    # Only remove checkpoint on natural completion (early stop / all epochs done).
+    # On Ctrl+C we keep it so the next run can resume and continue training.
+    if training_complete and os.path.exists(CHECKPOINT_PATH):
         os.remove(CHECKPOINT_PATH)
         print(f"[Checkpoint] Removed {CHECKPOINT_PATH} (training complete)")
 
