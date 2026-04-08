@@ -54,7 +54,7 @@ EPOCHS             = 500
 BATCH_SIZE         = 64   # 128 OOMs on Arc 530M (shared LPDDR5); use 32 if still OOM
 WARMUP_EPOCHS      = 20   # Linear LR warm-up before cosine decay
 BASE_LR            = 3e-4
-PATIENCE           = 50   # Stop if best loss doesn't improve for this many epochs
+PATIENCE           = 100  # Stop if best loss doesn't improve for this many epochs
 CHECKPOINT_EVERY   = 2    # Save a resume checkpoint every N epochs
 CHECKPOINT_PATH    = "models/checkpoint.pt"
 
