@@ -132,43 +132,53 @@ class SmartPenDecoder(nn.Module):
         return logits
 
 
+DATASET_CACHE = "data/dataset_cache.pt"
+
 # ---------------------------------------------------------
 # 3. DATA LOADING
 # ---------------------------------------------------------
 def load_dataset(data_dir="data"):
-    """Reads all CSVs exported by the C++ Autonomous Collector"""
-    sequences = []
-    targets = []
+    """Load training tensors from cache or build from CSVs.
 
+    First run: reads all 2400 CSVs, converts to tensors, saves a single
+    dataset_cache.pt.  Every subsequent run loads that one file — startup
+    drops from ~10 s to < 1 s.
+
+    Delete data/dataset_cache.pt whenever you regenerate synthetic data so
+    the cache is rebuilt from the new CSVs.
+    """
+    if os.path.exists(DATASET_CACHE):
+        print(f"[Dataset] Loading cache from {DATASET_CACHE} ...")
+        cached = torch.load(DATASET_CACHE, map_location="cpu")
+        return cached["X"], cached["Y"]
+
+    print("[Dataset] Cache not found — reading CSVs (first run only) ...")
     if not os.path.exists(data_dir):
-        print(f"[Error] Directory '{data_dir}' not found! Run generate_synthetic_data.py first.")
-        return sequences, targets
+        print(f"[Error] '{data_dir}' not found! Run generate_synthetic_data.py first.")
+        return [], []
 
+    sequences, targets = [], []
     for label_folder in sorted(os.listdir(data_dir)):
         folder_path = os.path.join(data_dir, label_folder)
         if not os.path.isdir(folder_path):
             continue
-
         csv_files = glob.glob(f"{folder_path}/*.csv")
         if not csv_files:
             continue
-
         for csv_file in csv_files:
             df = pd.read_csv(csv_file)
-
-            # Extract the 3 physical features (Skip timestamp)
-            tensor_data = torch.tensor(
-                df[["x", "y", "accel_z"]].values, dtype=torch.float32
+            sequences.append(
+                torch.tensor(df[["x", "y", "accel_z"]].values, dtype=torch.float32)
+            )
+            targets.append(
+                torch.tensor(
+                    [CHAR_TO_IDX[c] for c in label_folder if c in CHAR_TO_IDX],
+                    dtype=torch.long,
+                )
             )
 
-            # Convert the folder name (e.g., "hello") into target IDs
-            target_ids = [
-                CHAR_TO_IDX[char] for char in label_folder if char in CHAR_TO_IDX
-            ]
-
-            sequences.append(tensor_data)
-            targets.append(torch.tensor(target_ids, dtype=torch.long))
-
+    torch.save({"X": sequences, "Y": targets}, DATASET_CACHE)
+    print(f"[Dataset] Cached {len(sequences)} samples to {DATASET_CACHE}")
     return sequences, targets
 
 

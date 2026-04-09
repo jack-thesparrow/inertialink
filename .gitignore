@@ -62,8 +62,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Ignore our generated ML datasets (CSVs and Pickles)
+# Ignore generated ML datasets, caches, and model outputs
 data/
+models/
 *.pkl
 *.csv
 
