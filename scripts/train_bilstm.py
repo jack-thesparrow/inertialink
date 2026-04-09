@@ -12,6 +12,7 @@ import glob
 import random
 import math
 import sys
+import queue
 import threading
 import torch
 import torch.nn as nn
@@ -219,16 +220,45 @@ def build_batches(X_train, Y_train, indices, batch_size):
     return batches
 
 
-def prefetch_batches_async(X_train, Y_train, indices, batch_size, result):
-    """Build next epoch's batches in a background thread.
+class EpochPrefetcher:
+    """Persistent background thread that keeps one pre-built epoch ready.
 
-    Runs concurrently while the current epoch trains so there is zero
-    idle time between epochs waiting for batch assembly.
-    result[0] is set to the built batch list when done.
+    Replaces the per-epoch Thread create/join pattern.  A single daemon
+    thread runs forever, builds the next epoch's batches into a Queue,
+    and blocks until the training loop consumes them.  The main thread
+    calls .next() which returns immediately if prefetch finished during
+    training, or waits the remaining time if training was unusually fast.
+
+    Eliminates the CPU dip at epoch boundaries caused by thread teardown,
+    GIL contention during Thread.__init__, and join() wait.
     """
-    shuffled = indices[:]
-    random.shuffle(shuffled)
-    result[0] = (shuffled, build_batches(X_train, Y_train, shuffled, batch_size))
+
+    def __init__(self, X_train, Y_train, batch_size: int):
+        self._X          = X_train
+        self._Y          = Y_train
+        self._batch_size = batch_size
+        self._queue: "queue.Queue[tuple]" = queue.Queue(maxsize=1)
+        self._stop       = threading.Event()
+        self._thread     = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        indices = list(range(len(self._X)))
+        while not self._stop.is_set():
+            random.shuffle(indices)
+            batches = build_batches(self._X, self._Y, indices, self._batch_size)
+            # put() blocks if the queue already holds one epoch (training hasn't
+            # consumed the previous result yet) — no busy-wait, no wasted CPU.
+            self._queue.put((indices[:], batches))
+
+    def next(self) -> tuple:
+        """Return (indices, batches) for the next epoch.  Blocks only if the
+        worker hasn't finished building yet (training was faster than prefetch).
+        """
+        return self._queue.get()
+
+    def stop(self):
+        self._stop.set()
 
 
 # ---------------------------------------------------------
@@ -351,18 +381,15 @@ def train_and_export():
     accel.append("oneDNN-fusion")
     accel.append("bf16" if USE_BF16 else "fp32")
     accel.append("foreach-adam")
-    accel.append("async-prefetch")
+    accel.append("persistent-prefetch")
     accel.append("bucket-batching")
     print(f"Acceleration: {' | '.join(accel)}")
 
-    # Kick off the first prefetch before epoch 1 starts
-    _prefetch_result = [None]
-    _prefetch_thread = threading.Thread(
-        target=prefetch_batches_async,
-        args=(X_train, Y_train, indices, BATCH_SIZE, _prefetch_result),
-        daemon=True,
-    )
-    _prefetch_thread.start()
+    # Persistent prefetch worker — one thread lives for the whole training run.
+    # It builds the next epoch's batches into a queue while the current epoch
+    # trains, then blocks until training consumes the result.  No per-epoch
+    # thread create/join overhead → smoother CPU utilisation across epochs.
+    prefetcher = EpochPrefetcher(X_train, Y_train, BATCH_SIZE)
 
     model.train()
     try:
@@ -372,21 +399,12 @@ def train_and_export():
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            # Wait for prefetch thread to finish, grab its batches
-            _prefetch_thread.join()
-            indices, batches = _prefetch_result[0]
+            # Grab the pre-built batches for this epoch (returns immediately
+            # if the worker finished during last epoch, else waits the diff).
+            indices, batches = prefetcher.next()
             n_batches   = len(batches)
             batch_count = 0
             total_loss  = 0.0
-
-            # Start prefetching NEXT epoch's batches immediately in background
-            _prefetch_result = [None]
-            _prefetch_thread = threading.Thread(
-                target=prefetch_batches_async,
-                args=(X_train, Y_train, indices, BATCH_SIZE, _prefetch_result),
-                daemon=True,
-            )
-            _prefetch_thread.start()
 
             for x_pad, lengths, targets, target_lengths in batches:
                 # set_to_none=True: skips the memset that zero_grad() does —
@@ -476,8 +494,12 @@ def train_and_export():
         print(f"\n\n[Interrupted] ", end="")
         if best_weights is None:
             print("No epoch completed — nothing to export. Re-run and let at least 1 epoch finish.")
+            prefetcher.stop()
             return
         print(f"Exporting model at best loss {best_loss:.4f} (checkpoint kept — re-run to continue training) ...")
+
+    finally:
+        prefetcher.stop()
 
     # Restore the best weights seen during training.
     # best_weights is always saved from raw_model so keys are clean — load directly.
