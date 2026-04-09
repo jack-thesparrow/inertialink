@@ -22,6 +22,23 @@ static const std::string ALPHABET =
 static constexpr const char *MODEL_PATH = "models/pen_model.onnx";
 
 // ---------------------------------------------------------
+// SOFTMAX HELPER
+// ---------------------------------------------------------
+// Converts raw logits for one timestep into probabilities.
+// Uses max-subtraction for numerical stability (avoids exp() overflow).
+static std::vector<float> softmax(const float *logits, int64_t n) {
+  float max_val = *std::max_element(logits, logits + n);
+  std::vector<float> probs(n);
+  float sum = 0.0f;
+  for (int64_t i = 0; i < n; ++i) {
+    probs[i] = std::exp(logits[i] - max_val);
+    sum += probs[i];
+  }
+  for (auto &p : probs) p /= sum;
+  return probs;
+}
+
+// ---------------------------------------------------------
 // ONNX INFERENCE & CTC DECODER
 // ---------------------------------------------------------
 void runAIInference(Ort::Session &session,
@@ -29,8 +46,7 @@ void runAIInference(Ort::Session &session,
   if (strokeBuffer.empty())
     return;
 
-  // 1. Flatten our structured data into a raw 1D float array for the Neural
-  // Network The AI expects shape: [1 (batch), Sequence_Length, 3 (features)]
+  // 1. Flatten stroke into [1, seq_len, 3] float array
   std::vector<float> input_tensor_values;
   input_tensor_values.reserve(strokeBuffer.size() * 3);
   for (const auto &pt : strokeBuffer) {
@@ -39,60 +55,83 @@ void runAIInference(Ort::Session &session,
     input_tensor_values.push_back(pt.accel_z);
   }
 
-  // 2. Define the Tensor Shapes
   Ort::MemoryInfo memory_info =
       Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
   std::vector<int64_t> input_shape = {
       1, static_cast<int64_t>(strokeBuffer.size()), 3};
 
-  // 3. Create the ONNX Input Tensor
   Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
       memory_info, input_tensor_values.data(), input_tensor_values.size(),
       input_shape.data(), input_shape.size());
 
-  const char *input_names[] = {"input_stroke"};
+  const char *input_names[]  = {"input_stroke"};
   const char *output_names[] = {"predicted_logits"};
 
   try {
-    // 4. RUN THE AI
     auto output_tensors = session.Run(Ort::RunOptions{nullptr}, input_names,
                                       &input_tensor, 1, output_names, 1);
 
-    // 5. EXTRACT THE MATH (Shape: [1, Sequence_Length, Num_Classes])
-    float *floatarr = output_tensors.front().GetTensorMutableData<float>();
-    auto output_type_info = output_tensors.front().GetTensorTypeAndShapeInfo();
-    auto output_shape = output_type_info.GetShape();
-
-    int64_t seq_len = output_shape[1];
+    // Shape: [1, seq_len, num_classes]
+    float *logits_ptr   = output_tensors.front().GetTensorMutableData<float>();
+    auto   output_shape = output_tensors.front().GetTensorTypeAndShapeInfo().GetShape();
+    int64_t seq_len     = output_shape[1];
     int64_t num_classes = output_shape[2];
 
-    // 6. CTC GREEDY DECODING
-    std::string predicted_text = "";
-    int last_char_index = 0; // Starts at <BLANK>
+    // CTC GREEDY DECODING WITH CONFIDENCE
+    //
+    // At each timestep we softmax the raw logits and take the argmax.
+    // Confidence is tracked only for frames that emit a character
+    // (non-blank AND not a consecutive duplicate) — those are the frames
+    // that actually built the predicted word.
+    // Overall confidence = mean of per-character peak softmax probabilities.
+    struct CharResult { char ch; float prob; };
+    std::vector<CharResult> chars;
+    int last_class = 0; // start at CTC blank
 
     for (int64_t t = 0; t < seq_len; ++t) {
-      int best_class = 0;
-      float max_prob = -1e9; // Start with a very low number
+      const float *frame  = logits_ptr + t * num_classes;
+      auto probs          = softmax(frame, num_classes);
 
-      // Find the most likely character for this specific millisecond frame
-      for (int c = 0; c < num_classes; ++c) {
-        float prob = floatarr[t * num_classes + c];
-        if (prob > max_prob) {
-          max_prob = prob;
-          best_class = c;
-        }
+      // argmax
+      int   best_class = static_cast<int>(
+          std::max_element(probs.begin(), probs.end()) - probs.begin());
+      float best_prob  = probs[best_class];
+
+      if (best_class != 0 && best_class != last_class) {
+        chars.push_back({ALPHABET[best_class], best_prob});
       }
+      last_class = best_class;
+    }
 
-      // CTC Rule: Ignore <BLANK> (0) and ignore consecutive duplicates!
-      if (best_class != 0 && best_class != last_char_index) {
-        predicted_text += ALPHABET[best_class];
-      }
+    // Build result strings
+    std::string predicted_text;
+    float confidence_sum = 0.0f;
+    for (const auto &cr : chars) {
+      predicted_text += cr.ch;
+      confidence_sum += cr.prob;
+    }
 
-      last_char_index = best_class;
+    float overall_confidence =
+        chars.empty() ? 0.0f : (confidence_sum / chars.size()) * 100.0f;
+
+    // Per-character breakdown
+    std::string per_char;
+    for (const auto &cr : chars) {
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%c=%d%%  ", cr.ch,
+                    static_cast<int>(cr.prob * 100.0f));
+      per_char += buf;
     }
 
     std::cout << "\n====================================\n";
-    std::cout << ">> AI PREDICTION: \"" << predicted_text << "\"\n";
+    if (predicted_text.empty()) {
+      std::cout << ">> PREDICTION : (nothing recognised)\n";
+    } else {
+      std::cout << ">> PREDICTION : \"" << predicted_text << "\"\n";
+      std::cout << ">> CONFIDENCE : " << static_cast<int>(overall_confidence)
+                << "%\n";
+      std::cout << ">> PER CHAR   : " << per_char << "\n";
+    }
     std::cout << "====================================\n\n";
 
   } catch (const Ort::Exception &e) {
