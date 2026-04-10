@@ -228,35 +228,50 @@ void Visualizer::drawCube(const IMUData &imu) {
   // ==========================================
   // RIGHT VIEWPORT: 2D Stroke Canvas
   // ==========================================
-  glViewport(halfWidth, 0, halfWidth,
-             height); // Tell OpenGL to only draw on the right half
+  glViewport(halfWidth, 0, halfWidth, height);
 
-  // Calculate the 2D coordinate directly from pitch and yaw
-  float canvasScale = 4.0f;
-  glm::vec3 newPoint(-imu.yaw * canvasScale, imu.pitch * canvasScale, 0.0f);
+  // Lever-arm projection — identical physics to data_collector and decoder.
+  //   x_mm = -yaw_rad  * leverArmMm
+  //   y_mm =  pitch_rad * leverArmMm
+  // Scale: 100 mm of pen travel = 1.0 GL unit, so a typical word fits well.
+  constexpr float MM_TO_GL = 1.0f / 100.0f;
+  glm::vec3 pt(
+      -imu.yaw   * pen::Defaults::leverArmMm * MM_TO_GL,
+       imu.pitch * pen::Defaults::leverArmMm * MM_TO_GL,
+      0.0f);
 
-  // Add the point to our stroke trail
-  if (strokeTrail.empty() ||
-      glm::length(strokeTrail.back() - newPoint) > 0.005f) {
-    strokeTrail.push_back(newPoint);
-    if (strokeTrail.size() > 2000)
-      strokeTrail.erase(strokeTrail.begin());
+  // First point after a clear becomes the anchor; every subsequent point is
+  // stored relative to it so the stroke always starts at the canvas centre.
+  if (strokeTrail.empty()) {
+    strokeAnchor = pt;
+    strokeTrail.push_back(glm::vec3(0.0f));
+  } else {
+    glm::vec3 rel = pt - strokeAnchor;
+    if (glm::length(rel - strokeTrail.back()) > 0.002f) {
+      strokeTrail.push_back(rel);
+      if (strokeTrail.size() > 2000)
+        strokeTrail.erase(strokeTrail.begin());
+    }
   }
 
-  glm::mat4 trailModel = glm::mat4(1.0f); // Trail stays static on the canvas
-  glm::mat4 trailMVP = projection * view * trailModel;
+  // Orthographic projection — correct for 2D; perspective would distort strokes.
+  // ±1.5 GL units covers ±150 mm of pen travel at current scale.
+  float aspect = static_cast<float>(halfWidth) / static_cast<float>(height);
+  glm::mat4 ortho = glm::ortho(-1.5f * aspect,  1.5f * aspect,
+                                -1.5f,            1.5f,
+                                -1.0f,            1.0f);
 
   glUseProgram(trailShaderProgram);
   glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"), 1,
-                     GL_FALSE, glm::value_ptr(trailMVP));
+                     GL_FALSE, glm::value_ptr(ortho));
 
   glBindVertexArray(trailVAO);
   glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
-  glBufferData(GL_ARRAY_BUFFER, strokeTrail.size() * sizeof(glm::vec3),
+  glBufferData(GL_ARRAY_BUFFER,
+               static_cast<GLsizeiptr>(strokeTrail.size() * sizeof(glm::vec3)),
                strokeTrail.data(), GL_DYNAMIC_DRAW);
-
   glLineWidth(4.0f);
-  glDrawArrays(GL_LINE_STRIP, 0, strokeTrail.size());
+  glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(strokeTrail.size()));
 }
 
 } // namespace pen

@@ -27,6 +27,7 @@ private:
   unsigned int trailShaderProgram;
   unsigned int trailVAO, trailVBO;
   std::vector<glm::vec3> strokeTrail;
+  glm::vec3 strokeAnchor{0.0f};   // first point of current stroke; trail is relative to this
 
   void initOpenGL();
   void setupGeometry();

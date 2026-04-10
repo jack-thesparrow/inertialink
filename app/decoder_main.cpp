@@ -5,6 +5,7 @@
 #include <iostream>
 #include <onnxruntime_cxx_api.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ML Input Format
@@ -22,20 +23,126 @@ static const std::string ALPHABET =
 static constexpr const char *MODEL_PATH = "models/pen_model.onnx";
 
 // ---------------------------------------------------------
-// SOFTMAX HELPER
+// HELPERS
 // ---------------------------------------------------------
-// Converts raw logits for one timestep into probabilities.
-// Uses max-subtraction for numerical stability (avoids exp() overflow).
 static std::vector<float> softmax(const float *logits, int64_t n) {
   float max_val = *std::max_element(logits, logits + n);
   std::vector<float> probs(n);
   float sum = 0.0f;
-  for (int64_t i = 0; i < n; ++i) {
-    probs[i] = std::exp(logits[i] - max_val);
-    sum += probs[i];
-  }
+  for (int64_t i = 0; i < n; ++i) { probs[i] = std::exp(logits[i] - max_val); sum += probs[i]; }
   for (auto &p : probs) p /= sum;
   return probs;
+}
+
+// Numerically stable log(exp(a) + exp(b)).
+static constexpr float LOG_ZERO = -1e30f;
+static float log_sum_exp(float a, float b) {
+  if (a <= LOG_ZERO) return b;
+  if (b <= LOG_ZERO) return a;
+  float hi = std::max(a, b), lo = std::min(a, b);
+  return hi + std::log1pf(std::expf(lo - hi));
+}
+
+// ---------------------------------------------------------
+// CTC BEAM SEARCH
+// ---------------------------------------------------------
+// A beam tracks two log-probabilities:
+//   log_pb  — probability of all paths ending in CTC blank
+//   log_pnb — probability of all paths ending in a real character
+struct Beam {
+  float log_pb  = LOG_ZERO;
+  float log_pnb = LOG_ZERO;
+  float log_total() const { return log_sum_exp(log_pb, log_pnb); }
+};
+
+static constexpr int BEAM_WIDTH = 10;
+
+// Returns the decoded text.  Also fills per_char_conf with peak softmax
+// probabilities for each emitted character (for the confidence display).
+static std::string ctc_beam_search(
+    const float *logits_ptr, int64_t seq_len, int64_t num_classes,
+    std::vector<std::pair<char, float>> &per_char_conf)
+{
+  // beams[prefix] = Beam
+  std::unordered_map<std::string, Beam> beams;
+  beams[""].log_pb = 0.0f;   // empty prefix, probability 1 (log = 0)
+
+  for (int64_t t = 0; t < seq_len; ++t) {
+    const float *frame = logits_ptr + t * num_classes;
+    std::vector<float> lp(num_classes);
+    {
+      auto probs = softmax(frame, num_classes);
+      for (int c = 0; c < num_classes; ++c)
+        lp[c] = (probs[c] > 1e-30f) ? std::log(probs[c]) : LOG_ZERO;
+    }
+
+    std::unordered_map<std::string, Beam> next;
+    next.reserve(beams.size() * 4);
+
+    for (auto &[prefix, bm] : beams) {
+      char last = prefix.empty() ? '\0' : prefix.back();
+
+      // ── extend with blank ──
+      next[prefix].log_pb =
+          log_sum_exp(next[prefix].log_pb,
+                      log_sum_exp(bm.log_pb, bm.log_pnb) + lp[0]);
+
+      // ── extend with each character ──
+      for (int c = 1; c < static_cast<int>(num_classes); ++c) {
+        char ch = ALPHABET[c];
+        if (ch == last) {
+          // Duplicate: blank path emits new char; nonblank path stays
+          std::string ext = prefix + ch;
+          next[ext].log_pnb =
+              log_sum_exp(next[ext].log_pnb, bm.log_pb + lp[c]);
+          next[prefix].log_pnb =
+              log_sum_exp(next[prefix].log_pnb, bm.log_pnb + lp[c]);
+        } else {
+          std::string ext = prefix + ch;
+          next[ext].log_pnb =
+              log_sum_exp(next[ext].log_pnb,
+                          log_sum_exp(bm.log_pb, bm.log_pnb) + lp[c]);
+        }
+      }
+    }
+
+    // Prune to top BEAM_WIDTH by total log-probability
+    if (static_cast<int>(next.size()) > BEAM_WIDTH) {
+      std::vector<std::pair<float, std::string>> scores;
+      scores.reserve(next.size());
+      for (auto &[p, b] : next) scores.emplace_back(b.log_total(), p);
+      std::partial_sort(scores.begin(), scores.begin() + BEAM_WIDTH,
+                        scores.end(), std::greater<>{});
+      std::unordered_map<std::string, Beam> pruned;
+      pruned.reserve(BEAM_WIDTH);
+      for (int i = 0; i < BEAM_WIDTH; ++i) pruned[scores[i].second] = next[scores[i].second];
+      beams = std::move(pruned);
+    } else {
+      beams = std::move(next);
+    }
+  }
+
+  // Pick best beam
+  std::string best_text;
+  float best_score = LOG_ZERO;
+  for (auto &[p, b] : beams) {
+    if (b.log_total() > best_score) { best_score = b.log_total(); best_text = p; }
+  }
+
+  // Per-char confidence: for each character in the best text, find the peak
+  // softmax probability across all timesteps for that character's index.
+  for (char ch : best_text) {
+    auto pos = ALPHABET.find(ch);
+    if (pos == std::string::npos) continue;
+    float peak = 0.0f;
+    for (int64_t t = 0; t < seq_len; ++t) {
+      auto probs = softmax(logits_ptr + t * num_classes, num_classes);
+      peak = std::max(peak, probs[static_cast<int>(pos)]);
+    }
+    per_char_conf.push_back({ch, peak});
+  }
+
+  return best_text;
 }
 
 // ---------------------------------------------------------
@@ -77,49 +184,24 @@ void runAIInference(Ort::Session &session,
     int64_t seq_len     = output_shape[1];
     int64_t num_classes = output_shape[2];
 
-    // CTC GREEDY DECODING WITH CONFIDENCE
-    //
-    // At each timestep we softmax the raw logits and take the argmax.
-    // Confidence is tracked only for frames that emit a character
-    // (non-blank AND not a consecutive duplicate) — those are the frames
-    // that actually built the predicted word.
-    // Overall confidence = mean of per-character peak softmax probabilities.
-    struct CharResult { char ch; float prob; };
-    std::vector<CharResult> chars;
-    int last_class = 0; // start at CTC blank
+    // CTC BEAM SEARCH DECODING
+    // Tracks BEAM_WIDTH=10 candidate prefixes simultaneously, accumulating
+    // path probabilities in log-space to avoid float underflow.
+    // Recovers characters that greedy argmax would drop (e.g. 'o' in "world").
+    std::vector<std::pair<char, float>> char_confs;
+    std::string predicted_text =
+        ctc_beam_search(logits_ptr, seq_len, num_classes, char_confs);
 
-    for (int64_t t = 0; t < seq_len; ++t) {
-      const float *frame  = logits_ptr + t * num_classes;
-      auto probs          = softmax(frame, num_classes);
-
-      // argmax
-      int   best_class = static_cast<int>(
-          std::max_element(probs.begin(), probs.end()) - probs.begin());
-      float best_prob  = probs[best_class];
-
-      if (best_class != 0 && best_class != last_class) {
-        chars.push_back({ALPHABET[best_class], best_prob});
-      }
-      last_class = best_class;
+    float overall_confidence = 0.0f;
+    if (!char_confs.empty()) {
+      for (auto &[ch, p] : char_confs) overall_confidence += p;
+      overall_confidence = overall_confidence / char_confs.size() * 100.0f;
     }
 
-    // Build result strings
-    std::string predicted_text;
-    float confidence_sum = 0.0f;
-    for (const auto &cr : chars) {
-      predicted_text += cr.ch;
-      confidence_sum += cr.prob;
-    }
-
-    float overall_confidence =
-        chars.empty() ? 0.0f : (confidence_sum / chars.size()) * 100.0f;
-
-    // Per-character breakdown
     std::string per_char;
-    for (const auto &cr : chars) {
+    for (auto &[ch, p] : char_confs) {
       char buf[16];
-      std::snprintf(buf, sizeof(buf), "%c=%d%%  ", cr.ch,
-                    static_cast<int>(cr.prob * 100.0f));
+      std::snprintf(buf, sizeof(buf), "%c=%d%%  ", ch, static_cast<int>(p * 100.0f));
       per_char += buf;
     }
 
