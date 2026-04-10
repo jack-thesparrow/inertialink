@@ -7,8 +7,9 @@ import time
 import socket
 import pandas as pd
 
-UDP_IP   = "127.0.0.1"
-UDP_PORT = 5005
+UDP_IP       = "127.0.0.1"
+DECODER_PORT = 5005   # pen::Defaults::wifiPort    — decoder listens here
+VIZ_PORT     = 5006   # pen::Defaults::wifiVizPort — visualizer listens here
 LEVER_ARM_MM = 150.0  # Must match pen::Defaults::leverArmMm in io.hpp
 
 # All words the model was trained on
@@ -16,9 +17,14 @@ TRAINED_WORDS = ["hello", "world", "pen", "123", "write",
                  "note", "data", "code", "test", "abc", "xyz", "open"]
 
 print("=== ESP32 Hardware Simulator ===")
-print(f"Target: {UDP_IP}:{UDP_PORT} (WiFi Mode)")
+print(f"Target: {UDP_IP}  decoder={DECODER_PORT}  visualizer={VIZ_PORT}")
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def broadcast(msg: bytes) -> None:
+    """Send to decoder and visualizer simultaneously."""
+    sock.sendto(msg, (UDP_IP, DECODER_PORT))
+    sock.sendto(msg, (UDP_IP, VIZ_PORT))
 
 
 def stream_csv(filepath: str) -> pd.Series:
@@ -34,7 +40,7 @@ def stream_csv(filepath: str) -> pd.Series:
         pitch = math.degrees( row["y"] / LEVER_ARM_MM)
         roll  = 0.0
         msg = f"{pitch:.4f},{roll:.4f},{yaw:.4f},{row['accel_z']:.4f}\n".encode()
-        sock.sendto(msg, (UDP_IP, UDP_PORT))
+        broadcast(msg)
         time.sleep(0.01)  # 10 ms = 100 Hz
 
     return df.iloc[-1]
@@ -70,7 +76,7 @@ def simulate_word(word: str, sample: str = "random") -> None:
     # 1. Idle burst so C++ can reach its wake-on-impact state
     print("[Hardware] Sending idle data...")
     for _ in range(100):
-        sock.sendto(b"0.0,0.0,0.0,0.0\n", (UDP_IP, UDP_PORT))
+        broadcast(b"0.0,0.0,0.0,0.0\n")
         time.sleep(0.01)
 
     # 2. Stream the actual stroke
@@ -85,7 +91,7 @@ def simulate_word(word: str, sample: str = "random") -> None:
 
     print(f"[Hardware] Pen lifted — waiting for AI to process...")
     for _ in range(250):
-        sock.sendto(idle_msg, (UDP_IP, UDP_PORT))
+        broadcast(idle_msg)
         time.sleep(0.01)
 
     print("[Hardware] Simulation complete.\n")

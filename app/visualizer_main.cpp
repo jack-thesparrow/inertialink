@@ -8,11 +8,14 @@ int main(int argc, char *argv[]) {
   // WiFi ESP32.  Other modes match the decoder's argument names exactly so
   // both programs are invoked the same way.
   //
-  //   ./bin/visualizer            → WiFi UDP port 5005  (same as mock_esp32.py)
-  //   ./bin/visualizer wifi       → WiFi UDP port 5005
+  //   ./bin/visualizer            → WiFi UDP port 5006  (dedicated viz port)
+  //   ./bin/visualizer wifi       → WiFi UDP port 5006
   //   ./bin/visualizer usb        → /dev/ttyUSB0
   //   ./bin/visualizer bt         → /dev/rfcomm0
   //   ./bin/visualizer sim        → /tmp/vtty_laptop  (socat virtual cable)
+  //
+  // Port split: decoder=5005, visualizer=5006.  mock_esp32.py sends to both
+  // so decoder + visualizer can run simultaneously without packet loss.
   //
   // Controls:
   //   C      — clear stroke canvas
@@ -28,7 +31,7 @@ int main(int argc, char *argv[]) {
   else if (mode == "sim")
     backend.connectUSB("/tmp/vtty_laptop");
   else // "wifi" (default)
-    backend.connectWiFi(pen::Defaults::wifiPort);
+    backend.connectWiFi(pen::Defaults::wifiVizPort);
 
   std::cout << "=== Smart Pen Visualizer ===\n";
   std::cout << "Mode   : " << backend.getStatus() << "\n";

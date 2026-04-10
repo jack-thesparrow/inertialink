@@ -15,7 +15,11 @@ struct Defaults {
   // Connection
   static constexpr const char *usbPort       = "/dev/ttyUSB0";
   static constexpr const char *bluetoothPort = "/dev/rfcomm0";
-  static constexpr int         wifiPort      = 5005;
+  // Decoder and visualizer listen on separate ports so both can run
+  // simultaneously — SO_REUSEPORT load-balances (one receiver per packet),
+  // two ports guarantee each process sees every packet independently.
+  static constexpr int wifiPort    = 5005;  // decoder
+  static constexpr int wifiVizPort = 5006;  // visualizer
 
   // Physics — distance (mm) from wrist pivot to pen tip used by both the
   // data collector and the ML decoder to project IMU angles onto 2-D canvas.
