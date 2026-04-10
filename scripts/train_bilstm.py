@@ -12,6 +12,7 @@ import glob
 import random
 import math
 import sys
+import datetime
 import queue
 import threading
 import torch
@@ -89,6 +90,7 @@ BASE_LR            = 3e-4
 PATIENCE           = 150  # Must be > EPOCHS/2 so cosine has room to work
 CHECKPOINT_EVERY   = 2    # Save a resume checkpoint every N epochs
 CHECKPOINT_PATH    = "models/checkpoint.pt"
+LOG_PATH           = "models/training_log.csv"
 
 
 # ---------------------------------------------------------
@@ -471,6 +473,17 @@ def train_and_export():
             )
             # Pad to 80 chars so any leftover progress-bar text is overwritten
             print(f"\r{line:<80}")
+
+            # Append one row to the training log (creates file + header if new).
+            log_exists = os.path.exists(LOG_PATH)
+            with open(LOG_PATH, "a") as log_f:
+                if not log_exists:
+                    log_f.write("epoch,loss,best_loss,lr,no_improve,timestamp\n")
+                log_f.write(
+                    f"{epoch+1},{avg_loss:.6f},{best_loss:.6f},"
+                    f"{lr:.2e},{no_improve},"
+                    f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
 
             # Save checkpoint every N epochs so training can resume after a crash.
             # Always use raw_model.state_dict() — clean keys, no _orig_mod. prefix.
