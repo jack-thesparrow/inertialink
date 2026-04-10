@@ -13,13 +13,22 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 if command_exists apt; then
   echo "[+] Detected Debian/Ubuntu (apt). Checking tools..."
   sudo apt update
-  sudo apt install -y build-essential cmake ninja-build libx11-dev libwayland-dev libxkbcommon-dev libxrandr curl python3-venv
+  # Full GLFW dependency set: libxrandr, libxinerama, libxcursor, libxi are
+  # required in addition to the base libx11 — missing any causes cmake to fail.
+  sudo apt install -y build-essential cmake ninja-build \
+    libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+    libwayland-dev libxkbcommon-dev \
+    libgl1-mesa-dev curl python3-venv
 elif command_exists pacman; then
   echo "[+] Detected Arch Linux (pacman). Checking tools..."
-  sudo pacman -Sy --needed base-devel cmake ninja wayland curl python
+  sudo pacman -Sy --needed base-devel cmake ninja \
+    libx11 libxrandr libxinerama libxcursor libxi \
+    wayland libxkbcommon mesa curl python
 elif command_exists dnf; then
   echo "[+] Detected Fedora/RHEL (dnf). Checking tools..."
-  sudo dnf install -y gcc-c++ cmake ninja-build libX11-devel wayland-devel curl python3
+  sudo dnf install -y gcc-c++ cmake ninja-build \
+    libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel \
+    wayland-devel libxkbcommon-devel mesa-libGL-devel curl python3
 else
   echo "[-] Unsupported package manager. Please install CMake and a C++ compiler manually."
   exit 1
