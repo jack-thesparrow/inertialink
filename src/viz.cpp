@@ -50,8 +50,11 @@ void main() {
 )";
 
 Visualizer::Visualizer(int width, int height, const char *title) {
-  if (!glfwInit())
+  if (!glfwInit()) {
+    std::cerr << "[Viz] FATAL: glfwInit() failed.\n"
+              << "      Is a display server running? (check $DISPLAY / $WAYLAND_DISPLAY)\n";
     exit(-1);
+  }
 
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -60,13 +63,24 @@ Visualizer::Visualizer(int width, int height, const char *title) {
 
   window = glfwCreateWindow(width, height, title, nullptr, nullptr);
   if (!window) {
+    // Retry without MSAA — some Mesa / Intel Arc drivers reject multisampling
+    glfwWindowHint(GLFW_SAMPLES, 0);
+    window = glfwCreateWindow(width, height, title, nullptr, nullptr);
+  }
+  if (!window) {
+    std::cerr << "[Viz] FATAL: glfwCreateWindow() failed.\n"
+              << "      OpenGL 3.3 Core Profile may not be supported by this driver.\n"
+              << "      Try: glxinfo | grep 'OpenGL version'\n";
     glfwTerminate();
     exit(-1);
   }
 
   glfwMakeContextCurrent(window);
-  if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+  if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+    std::cerr << "[Viz] FATAL: gladLoadGLLoader() failed — GL function pointers unavailable.\n";
+    glfwTerminate();
     exit(-1);
+  }
 
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_MULTISAMPLE);

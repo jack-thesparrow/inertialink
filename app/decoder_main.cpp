@@ -22,9 +22,44 @@ static const std::string ALPHABET =
     "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 static constexpr const char *MODEL_PATH = "models/pen_model.onnx";
 
+// Words the model was trained on — must match mock_esp32.py TRAINED_WORDS.
+// After beam-search decoding, the raw prediction is snapped to the nearest
+// vocabulary entry (Levenshtein ≤ 2) so that partial drops like "nte"→"note"
+// or "wrld"→"world" are automatically corrected.
+static const std::vector<std::string> VOCABULARY = {
+    "hello", "world", "pen", "123", "write",
+    "note",  "data",  "code","test", "abc", "xyz", "open"};
+
 // ---------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------
+static int editDistance(const std::string &a, const std::string &b) {
+  int m = static_cast<int>(a.size()), n = static_cast<int>(b.size());
+  std::vector<int> prev(n + 1), curr(n + 1);
+  for (int j = 0; j <= n; ++j) prev[j] = j;
+  for (int i = 1; i <= m; ++i) {
+    curr[0] = i;
+    for (int j = 1; j <= n; ++j)
+      curr[j] = (a[i-1] == b[j-1]) ? prev[j-1]
+                : 1 + std::min({prev[j], curr[j-1], prev[j-1]});
+    std::swap(prev, curr);
+  }
+  return prev[n];
+}
+
+// Snap raw CTC output to the nearest vocabulary word if within edit distance 2.
+// Returns {corrected_word, was_corrected}.
+static std::pair<std::string, bool> snapToVocab(const std::string &raw) {
+  if (raw.empty()) return {raw, false};
+  int   best_dist = 3; // only snap if dist <= 2
+  std::string best = raw;
+  for (const auto &w : VOCABULARY) {
+    int d = editDistance(raw, w);
+    if (d < best_dist) { best_dist = d; best = w; }
+  }
+  return {best, best != raw};
+}
+
 static std::vector<float> softmax(const float *logits, int64_t n) {
   float max_val = *std::max_element(logits, logits + n);
   std::vector<float> probs(n);
@@ -205,11 +240,15 @@ void runAIInference(Ort::Session &session,
       per_char += buf;
     }
 
+    auto [corrected, was_corrected] = snapToVocab(predicted_text);
+
     std::cout << "\n====================================\n";
-    if (predicted_text.empty()) {
+    if (corrected.empty()) {
       std::cout << ">> PREDICTION : (nothing recognised)\n";
     } else {
-      std::cout << ">> PREDICTION : \"" << predicted_text << "\"\n";
+      std::cout << ">> PREDICTION : \"" << corrected << "\"\n";
+      if (was_corrected)
+        std::cout << ">> RAW CTC    : \"" << predicted_text << "\" (snapped to vocab)\n";
       std::cout << ">> CONFIDENCE : " << static_cast<int>(overall_confidence)
                 << "%\n";
       std::cout << ">> PER CHAR   : " << per_char << "\n";
