@@ -273,17 +273,27 @@ void Visualizer::drawCube(const IMUData &imu) {
        imu.pitch * pen::Defaults::leverArmMm * MM_TO_GL,
       0.0f);
 
-  // First point after a clear becomes the anchor; every subsequent point is
-  // stored relative to it so the stroke always starts at the canvas centre.
-  if (strokeTrail.empty()) {
-    strokeAnchor = pt;
-    strokeTrail.push_back(glm::vec3(0.0f));
-  } else {
-    glm::vec3 rel = pt - strokeAnchor;
-    if (glm::length(rel - strokeTrail.back()) > 0.002f) {
-      strokeTrail.push_back(rel);
-      if (strokeTrail.size() > 2000)
-        strokeTrail.erase(strokeTrail.begin());
+  // Only accumulate trail while the pen is on paper.
+  // Synthetic CSVs set accel_z = 0.0 during inter-character hovers and the
+  // idle tail; the real IMU also reads near-zero when the pen is in the air.
+  // Skipping those frames prevents the "return-to-origin" artefact where the
+  // trail draws a straight line back to centre after the pen is lifted.
+  // Minimum writing pressure in synthetic data is ~0.09, so 0.05 is a safe
+  // threshold that accepts any real contact while rejecting idle frames.
+  constexpr float PEN_CONTACT_MIN = 0.05f;
+  if (std::abs(imu.accel_z) >= PEN_CONTACT_MIN) {
+    // First point after a clear becomes the anchor; every subsequent point is
+    // stored relative to it so the stroke always starts at the canvas centre.
+    if (strokeTrail.empty()) {
+      strokeAnchor = pt;
+      strokeTrail.push_back(glm::vec3(0.0f));
+    } else {
+      glm::vec3 rel = pt - strokeAnchor;
+      if (glm::length(rel - strokeTrail.back()) > 0.002f) {
+        strokeTrail.push_back(rel);
+        if (strokeTrail.size() > 2000)
+          strokeTrail.erase(strokeTrail.begin());
+      }
     }
   }
 
