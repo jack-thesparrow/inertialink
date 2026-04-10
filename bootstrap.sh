@@ -13,7 +13,7 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 if command_exists apt; then
   echo "[+] Detected Debian/Ubuntu (apt). Checking tools..."
   sudo apt update
-  sudo apt install -y build-essential cmake ninja-build libx11-dev libwayland-dev libxkbcommon-dev curl python3-venv
+  sudo apt install -y build-essential cmake ninja-build libx11-dev libwayland-dev libxkbcommon-dev libxrandr curl python3-venv
 elif command_exists pacman; then
   echo "[+] Detected Arch Linux (pacman). Checking tools..."
   sudo pacman -Sy --needed base-devel cmake ninja wayland curl python
