@@ -1,33 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(Inertialink VERSION 1.0 LANGUAGES CXX C)
-## --- Custom Progress Bar Macro ---
-#function(print_progress percentage message_text)
-#    math(EXPR num_bars "${percentage} / 10")
-#    math(EXPR num_spaces "10 - ${num_bars}")
-#    
-#    set(bar_string "")
-#    if(num_bars GREATER 0)
-#        foreach(i RANGE 1 ${num_bars})
-#            string(APPEND bar_string "█")
-#        endforeach()
-#    endif()
-#    
-#    set(space_string "")
-#    if(num_spaces GREATER 0)
-#        foreach(i RANGE 1 ${num_spaces})
-#            string(APPEND space_string " ")
-#        endforeach()
-#    endif()
-#
-#    message(STATUS "[${bar_string}${space_string}] ${percentage}% - ${message_text}")
-#endfunction()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Force CMake to generate compile_commands.json for Neovim
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Force CMake to generate compile_commands.json for Neovim
+# Generates compile_commands.json for clangd / Neovim / VS Code
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Automatically symlink compile_commands.json to the project root

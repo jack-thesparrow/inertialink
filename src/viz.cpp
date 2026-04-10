@@ -50,8 +50,11 @@ void main() {
 )";
 
 Visualizer::Visualizer(int width, int height, const char *title) {
-  if (!glfwInit())
+  if (!glfwInit()) {
+    std::cerr << "[Viz] FATAL: glfwInit() failed.\n"
+              << "      Is a display server running? (check $DISPLAY / $WAYLAND_DISPLAY)\n";
     exit(-1);
+  }
 
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -60,13 +63,24 @@ Visualizer::Visualizer(int width, int height, const char *title) {
 
   window = glfwCreateWindow(width, height, title, nullptr, nullptr);
   if (!window) {
+    // Retry without MSAA — some Mesa / Intel Arc drivers reject multisampling
+    glfwWindowHint(GLFW_SAMPLES, 0);
+    window = glfwCreateWindow(width, height, title, nullptr, nullptr);
+  }
+  if (!window) {
+    std::cerr << "[Viz] FATAL: glfwCreateWindow() failed.\n"
+              << "      OpenGL 3.3 Core Profile may not be supported by this driver.\n"
+              << "      Try: glxinfo | grep 'OpenGL version'\n";
     glfwTerminate();
     exit(-1);
   }
 
   glfwMakeContextCurrent(window);
-  if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+  if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+    std::cerr << "[Viz] FATAL: gladLoadGLLoader() failed — GL function pointers unavailable.\n";
+    glfwTerminate();
     exit(-1);
+  }
 
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_MULTISAMPLE);
@@ -184,33 +198,51 @@ void Visualizer::setupGeometry() {
 }
 
 void Visualizer::drawCube(const IMUData &imu) {
+  // ── New-stroke detection ──────────────────────────────────────────────────
+  // An accel_z spike (same threshold as data_collector and decoder) signals
+  // pen-on-paper impact.  On detection: clear the canvas trail and reset the
+  // cube anchor so the cube shows rotation *relative to the grip at stroke
+  // start* rather than the absolute IMU orientation.
+  if (prevIMUValid) {
+    float z_shock = std::abs(imu.accel_z - prevIMU.accel_z);
+    if (z_shock > pen::Defaults::wakeThresholdZ) {
+      strokeTrail.clear();   // strokeAnchor resets on next point (see below)
+      cubeAnchor = imu;      // cube neutral = current grip angle
+    }
+  } else {
+    cubeAnchor = imu;        // first frame: treat as anchor immediately
+  }
+  prevIMU      = imu;
+  prevIMUValid = true;
+
   int width, height;
   glfwGetFramebufferSize(window, &width, &height);
   int halfWidth = width / 2;
 
-  // Clear the ENTIRE window once
   glViewport(0, 0, width, height);
   glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-  // Both sides will share this camera setup, adjusted for the half-screen
-  // aspect ratio
   glm::mat4 view =
       glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.0f));
   glm::mat4 projection = glm::perspective(
       glm::radians(45.0f), (float)halfWidth / (float)height, 0.1f, 100.0f);
 
   // ==========================================
-  // LEFT VIEWPORT: 3D Spinning Cube
+  // LEFT VIEWPORT: 3D Cube (relative rotation)
   // ==========================================
-  glViewport(0, 0, halfWidth,
-             height); // Tell OpenGL to only draw on the left half
+  glViewport(0, 0, halfWidth, height);
+
+  // Rotate by delta from the anchor set at stroke start, so the cube sits at
+  // neutral when the pen first touches paper and shows only the writing motion.
+  float dYaw   = imu.yaw   - cubeAnchor.yaw;
+  float dPitch = imu.pitch - cubeAnchor.pitch;
+  float dRoll  = imu.roll  - cubeAnchor.roll;
 
   glm::mat4 cubeModel = glm::mat4(1.0f);
-  // The cube stays centered and just spins to show orientation
-  cubeModel = glm::rotate(cubeModel, imu.yaw, glm::vec3(0.0f, 1.0f, 0.0f));
-  cubeModel = glm::rotate(cubeModel, imu.pitch, glm::vec3(1.0f, 0.0f, 0.0f));
-  cubeModel = glm::rotate(cubeModel, imu.roll, glm::vec3(0.0f, 0.0f, 1.0f));
+  cubeModel = glm::rotate(cubeModel, dYaw,   glm::vec3(0.0f, 1.0f, 0.0f));
+  cubeModel = glm::rotate(cubeModel, dPitch, glm::vec3(1.0f, 0.0f, 0.0f));
+  cubeModel = glm::rotate(cubeModel, dRoll,  glm::vec3(0.0f, 0.0f, 1.0f));
 
   glm::mat4 cubeMVP = projection * view * cubeModel;
 
@@ -228,35 +260,61 @@ void Visualizer::drawCube(const IMUData &imu) {
   // ==========================================
   // RIGHT VIEWPORT: 2D Stroke Canvas
   // ==========================================
-  glViewport(halfWidth, 0, halfWidth,
-             height); // Tell OpenGL to only draw on the right half
+  glViewport(halfWidth, 0, halfWidth, height);
 
-  // Calculate the 2D coordinate directly from pitch and yaw
-  float canvasScale = 4.0f;
-  glm::vec3 newPoint(-imu.yaw * canvasScale, imu.pitch * canvasScale, 0.0f);
+  // Lever-arm projection — identical physics to data_collector and decoder.
+  //   x_mm = -yaw_rad  * leverArmMm
+  //   y_mm =  pitch_rad * leverArmMm
+  // Scale: 200 mm of pen travel = 1.0 GL unit; with ortho ±1.5 that gives
+  // ±300 mm of visible range — enough for the widest trained words.
+  constexpr float MM_TO_GL = 1.0f / 200.0f;
+  glm::vec3 pt(
+      -imu.yaw   * pen::Defaults::leverArmMm * MM_TO_GL,
+       imu.pitch * pen::Defaults::leverArmMm * MM_TO_GL,
+      0.0f);
 
-  // Add the point to our stroke trail
-  if (strokeTrail.empty() ||
-      glm::length(strokeTrail.back() - newPoint) > 0.005f) {
-    strokeTrail.push_back(newPoint);
-    if (strokeTrail.size() > 2000)
-      strokeTrail.erase(strokeTrail.begin());
+  // Only accumulate trail while the pen is on paper.
+  // Synthetic CSVs set accel_z = 0.0 during inter-character hovers and the
+  // idle tail; the real IMU also reads near-zero when the pen is in the air.
+  // Skipping those frames prevents the "return-to-origin" artefact where the
+  // trail draws a straight line back to centre after the pen is lifted.
+  // Minimum writing pressure in synthetic data is ~0.09, so 0.05 is a safe
+  // threshold that accepts any real contact while rejecting idle frames.
+  constexpr float PEN_CONTACT_MIN = 0.05f;
+  if (std::abs(imu.accel_z) >= PEN_CONTACT_MIN) {
+    // First point after a clear becomes the anchor; every subsequent point is
+    // stored relative to it so the stroke always starts at the canvas centre.
+    if (strokeTrail.empty()) {
+      strokeAnchor = pt;
+      strokeTrail.push_back(glm::vec3(0.0f));
+    } else {
+      glm::vec3 rel = pt - strokeAnchor;
+      if (glm::length(rel - strokeTrail.back()) > 0.002f) {
+        strokeTrail.push_back(rel);
+        if (strokeTrail.size() > 2000)
+          strokeTrail.erase(strokeTrail.begin());
+      }
+    }
   }
 
-  glm::mat4 trailModel = glm::mat4(1.0f); // Trail stays static on the canvas
-  glm::mat4 trailMVP = projection * view * trailModel;
+  // Orthographic projection — correct for 2D; perspective would distort strokes.
+  // ±1.5 GL units covers ±150 mm of pen travel at current scale.
+  float aspect = static_cast<float>(halfWidth) / static_cast<float>(height);
+  glm::mat4 ortho = glm::ortho(-1.5f * aspect,  1.5f * aspect,
+                                -1.5f,            1.5f,
+                                -1.0f,            1.0f);
 
   glUseProgram(trailShaderProgram);
   glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"), 1,
-                     GL_FALSE, glm::value_ptr(trailMVP));
+                     GL_FALSE, glm::value_ptr(ortho));
 
   glBindVertexArray(trailVAO);
   glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
-  glBufferData(GL_ARRAY_BUFFER, strokeTrail.size() * sizeof(glm::vec3),
+  glBufferData(GL_ARRAY_BUFFER,
+               static_cast<GLsizeiptr>(strokeTrail.size() * sizeof(glm::vec3)),
                strokeTrail.data(), GL_DYNAMIC_DRAW);
-
   glLineWidth(4.0f);
-  glDrawArrays(GL_LINE_STRIP, 0, strokeTrail.size());
+  glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(strokeTrail.size()));
 }
 
 } // namespace pen

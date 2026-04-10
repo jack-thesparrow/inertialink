@@ -7,12 +7,29 @@ namespace pen {
 // Connection mode — use this in the UI to drive PenBackend::connect*().
 enum class ConnectionMode { None, USB, Bluetooth, WiFi };
 
-// Default port/address values.  Reference these in the UI so nothing is
-// hardcoded in the app layer; override by passing explicit args to connect*().
+// Default port/address values and physics constants.
+// All app-layer code references these — nothing is hardcoded in the apps.
+// Keep leverArmMm / wakeThresholdZ / activityThreshold / idleTimeoutMs in sync
+// with generate_synthetic_data.py (IDLE_TIMEOUT_MS) and the ESP32 firmware.
 struct Defaults {
+  // Connection
   static constexpr const char *usbPort       = "/dev/ttyUSB0";
   static constexpr const char *bluetoothPort = "/dev/rfcomm0";
-  static constexpr int         wifiPort      = 5005;
+  // Decoder and visualizer listen on separate ports so both can run
+  // simultaneously — SO_REUSEPORT load-balances (one receiver per packet),
+  // two ports guarantee each process sees every packet independently.
+  static constexpr int wifiPort    = 5005;  // decoder
+  static constexpr int wifiVizPort = 5006;  // visualizer
+
+  // Physics — distance (mm) from wrist pivot to pen tip used by both the
+  // data collector and the ML decoder to project IMU angles onto 2-D canvas.
+  static constexpr float leverArmMm        = 150.0f;
+  // Z-axis shock magnitude that wakes the system from idle.
+  static constexpr float wakeThresholdZ    = 0.5f;
+  // Minimum angular delta (radians) that counts as pen movement.
+  static constexpr float activityThreshold = 0.02f;
+  // Milliseconds of stillness before a stroke is considered complete.
+  static constexpr int   idleTimeoutMs     = 2000;
 };
 
 struct IMUData {
@@ -40,7 +57,7 @@ private:
 class IMUReader {
 public:
   virtual ~IMUReader() = default;
-  virtual bool isOpen() const = 0;
+  [[nodiscard]] virtual bool isOpen() const = 0;
   virtual bool readData(IMUData &data) = 0;
 };
 
