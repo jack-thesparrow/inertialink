@@ -39,7 +39,11 @@ private:
   int         frameCount{0};
   std::string activeWord;        // last word read from /tmp/inertialink_word
 
+  // Text rendering (stb_easy_font quads → triangles)
+  unsigned int textVAO{0}, textVBO{0};
+
   void initOpenGL();
   void setupGeometry();
+  void renderWord(const std::string &word, int vpWidth, int vpHeight);
 };
 } // namespace pen

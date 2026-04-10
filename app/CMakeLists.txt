@@ -20,7 +20,7 @@ target_link_libraries(decoder PRIVATE "${onnxruntime_SOURCE_DIR}/lib/libonnxrunt
 # ==========================================
 add_executable(visualizer visualizer_main.cpp)
 # Link the Core backend, plus our graphics drivers (glad, glfw) and math library (glm)
-target_link_libraries(visualizer PRIVATE PenCore glad glfw glm)
+target_link_libraries(visualizer PRIVATE PenCore glad glfw glm stb)
 
 # ==========================================
 # APP 4: Terminal UI Launcher

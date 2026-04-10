@@ -1,3 +1,5 @@
+#include "stb_easy_font.h"
+
 #include "pen/viz.hpp"
 #include <glad/glad.h>
 // glad before GLFW
@@ -8,6 +10,7 @@
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace pen {
 
@@ -45,9 +48,10 @@ void main() {
 
 const char *trailFragmentShader = R"(
 #version 330 core
+uniform vec3 uColor;
 out vec4 FragColor;
 void main() {
-    FragColor = vec4(1.0, 0.6, 0.1, 1.0); // Bright Neon Orange
+    FragColor = vec4(uColor, 1.0);
 }
 )";
 
@@ -197,6 +201,15 @@ void Visualizer::setupGeometry() {
   glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void *)0);
   glEnableVertexAttribArray(0);
+
+  // --- Text Geometry Setup (dynamic; filled each frame by renderWord) ---
+  glGenVertexArrays(1, &textVAO);
+  glGenBuffers(1, &textVBO);
+  glBindVertexArray(textVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+  // 3 floats per vertex (x, y, z); stride = 3 * sizeof(float)
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
+  glEnableVertexAttribArray(0);
 }
 
 void Visualizer::drawCube(const IMUData &imu) {
@@ -329,6 +342,8 @@ void Visualizer::drawCube(const IMUData &imu) {
   glUseProgram(trailShaderProgram);
   glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"), 1,
                      GL_FALSE, glm::value_ptr(ortho));
+  // Neon orange for the stroke trail
+  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"), 1.0f, 0.6f, 0.1f);
 
   glBindVertexArray(trailVAO);
   glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
@@ -337,6 +352,73 @@ void Visualizer::drawCube(const IMUData &imu) {
                strokeTrail.data(), GL_DYNAMIC_DRAW);
   glLineWidth(4.0f);
   glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(strokeTrail.size()));
+
+  // ── Word label below the stroke canvas ──────────────────────────────────
+  if (!activeWord.empty())
+    renderWord(activeWord, halfWidth, height);
+}
+
+void Visualizer::renderWord(const std::string &word, int vpWidth, int vpHeight) {
+  // stb_easy_font generates quads (4 verts × 16 bytes each = 64 bytes/quad).
+  // GL Core Profile doesn't support GL_QUADS, so we convert each quad to
+  // two triangles (6 vertices) and upload as plain x,y,z float triples.
+  static char stbBuf[32 * 1024];
+  // const_cast is safe: stb only reads the string
+  int numQuads = stb_easy_font_print(
+      0.0f, 0.0f, const_cast<char *>(word.c_str()),
+      nullptr, stbBuf, static_cast<int>(sizeof(stbBuf)));
+  if (numQuads <= 0) return;
+
+  std::vector<float> verts;
+  verts.reserve(static_cast<std::size_t>(numQuads) * 6 * 3);
+  for (int q = 0; q < numQuads; ++q) {
+    const int base = q * 64;  // 4 verts × 16 bytes
+    float qx[4], qy[4];
+    for (int v = 0; v < 4; ++v) {
+      // stb vertex layout: float x, float y, float z, uint8[4] color
+      qx[v] = *reinterpret_cast<const float *>(stbBuf + base + v * 16 + 0);
+      qy[v] = *reinterpret_cast<const float *>(stbBuf + base + v * 16 + 4);
+    }
+    // Two CCW triangles from the quad: 0-1-2 and 0-2-3
+    auto push = [&](int i) {
+      verts.push_back(qx[i]);
+      verts.push_back(qy[i]);
+      verts.push_back(0.0f);
+    };
+    push(0); push(1); push(2);
+    push(0); push(2); push(3);
+  }
+
+  glBindVertexArray(textVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+  glBufferData(GL_ARRAY_BUFFER,
+               static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+               verts.data(), GL_DYNAMIC_DRAW);
+
+  // Scale and center at the bottom of the canvas.
+  // stb renders at ~7 px/char wide, 12 px/char tall.
+  // A scale of 2.5 gives readable ~30 px tall characters.
+  constexpr float kScale = 2.5f;
+  float textW = static_cast<float>(
+      stb_easy_font_width(const_cast<char *>(word.c_str())));
+  float tx    = (vpWidth - textW * kScale) * 0.5f;  // centred horizontally
+  float ty    = vpHeight - kScale * 12.0f - 6.0f;   // 6 px margin from bottom
+
+  // Pixel-space ortho: x right, y down (matches stb's coordinate convention).
+  glm::mat4 proj  = glm::ortho(0.0f, static_cast<float>(vpWidth),
+                                static_cast<float>(vpHeight), 0.0f,
+                                -1.0f, 1.0f);
+  glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(tx, ty, 0.0f))
+                  * glm::scale(glm::mat4(1.0f), glm::vec3(kScale, kScale, 1.0f));
+
+  glUseProgram(trailShaderProgram);
+  glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"),
+                     1, GL_FALSE, glm::value_ptr(proj * model));
+  // Bright cyan — distinct from the orange trail, visible on the dark bg
+  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"),
+              0.3f, 1.0f, 0.9f);
+
+  glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size() / 3));
 }
 
 } // namespace pen
