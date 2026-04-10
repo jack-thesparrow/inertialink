@@ -40,7 +40,7 @@ static float log_sum_exp(float a, float b) {
   if (a <= LOG_ZERO) return b;
   if (b <= LOG_ZERO) return a;
   float hi = std::max(a, b), lo = std::min(a, b);
-  return hi + std::log1pf(std::expf(lo - hi));
+  return hi + std::log1p(std::exp(lo - hi));
 }
 
 // ---------------------------------------------------------
