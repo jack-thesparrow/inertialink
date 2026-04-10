@@ -5,12 +5,13 @@
 //
 // Panels  (Tab cycles through them):
 //   0  Connection   — Radiobox: WiFi / USB / Bluetooth / Simulation
-//   1  Actions      — 6 tools; number keys 1-6 jump directly to any action
+//   1  Actions      — 6 tools; ↑↓ navigate, Enter run/stop
 //   2  Mock input   — word / 'all' text field (only reachable when Mock ESP32 selected)
 //   3  Test panel   — 12-word grid; ↑↓←→ navigate, Enter stream, A stream all
+//   4  Output/Log   — scrollable output from all processes
 //
 // Key map (global):
-//   1-6          jump to action (actions panel)
+//   1-4          switch panel (Connection / Actions / Test / Output)
 //   Tab          cycle panels
 //   ↑↓ / ←→     navigate within focused panel
 //   Enter        launch / stop  (actions)  or  stream word  (test panel)
@@ -74,6 +75,8 @@ static Proc procLaunch(const std::string &name, std::vector<std::string> args) {
   if (pid == 0) {
     ::dup2(fds[1], STDOUT_FILENO); ::dup2(fds[1], STDERR_FILENO);
     ::close(fds[0]); ::close(fds[1]);
+    // Force Python to flush every print() immediately when piped.
+    ::setenv("PYTHONUNBUFFERED", "1", 1);
     std::vector<char *> argv;
     for (auto &a : args) argv.push_back(a.data());
     argv.push_back(nullptr);
@@ -159,11 +162,12 @@ int main() {
 
   // ── State ──────────────────────────────────────────────────────────────────
   int act        = 0;
-  int focus      = 1;   // 0=conn, 1=actions, 2=mock-input, 3=test-panel
+  int focus      = 1;   // 0=conn, 1=actions, 2=mock-input, 3=test-panel, 4=log
   int ftFocus    = 0;   // index into Container::Tab children
   int logScroll  = 0;   // lines scrolled up from bottom
   std::vector<Proc> procs(kActions.size());
-  std::string mockWord = "hello";
+  std::string mockWord    = "hello";
+  std::string nowTesting;  // set by streamWord(), shown above the log
 
   // Map our 4-panel focus to the two real FTXUI components
   auto syncFt = [&] {
@@ -188,6 +192,7 @@ int main() {
     auto cmd = kActions[MOCK_IDX].cmd;
     cmd.push_back(word);
     procs[MOCK_IDX] = procLaunch("Mock:" + word, cmd);
+    nowTesting = (word == "all") ? "all 12 words" : word;
   };
 
   // ── FTXUI components ───────────────────────────────────────────────────────
@@ -208,10 +213,15 @@ int main() {
           text(" " + desc + "  "),
       });
     };
+    // Panel title: yellow + bold when focused, plain when not.
+    auto pTitle = [&](int panelFocus, const std::string &label) -> Element {
+      bool active = (focus == panelFocus);
+      return text(label) | bold | (active ? color(Color::Yellow) : color(Color::White));
+    };
 
     // ── Left: connection + status ─────────────────────────────────────────
     auto connBox = window(
-        text(" Connection ") | bold,
+        pTitle(0, " [1] Connection "),
         connRadio->Render());
 
     Elements dotRows;
@@ -249,7 +259,7 @@ int main() {
         text("  [Tab] to type") | dim,
     });
     auto actionsBox = window(
-        text(" Actions   1-6 jump   Enter run·stop ") | bold,
+        pTitle(1, " [2] Actions   ↑↓ navigate   Enter run·stop "),
         vbox({vbox(std::move(actRows)), separator(), mockRow}));
 
     // ── Right middle: test panel ──────────────────────────────────────────
@@ -273,7 +283,7 @@ int main() {
       wordRows.push_back(hbox(std::move(cols)));
     }
     auto testBox = window(
-        text(" Test Model   ↑↓←→ navigate   Enter stream   A all ") | bold,
+        pTitle(3, " [3] Test Model   ↑↓←→ navigate   Enter stream   A all "),
         vbox(std::move(wordRows)));
 
     // ── Right bottom: log ─────────────────────────────────────────────────
@@ -304,15 +314,21 @@ int main() {
       logRows.push_back(text("Waiting for output...") | dim | center);
 
     auto logBox = window(
-        text(" Output   PgUp/PgDn scroll   C clear ") | bold,
+        pTitle(4, " [4] Output   PgUp/PgDn scroll   C clear "),
         vbox(std::move(logRows))) | flex;
 
-    auto rightCol = vbox({actionsBox, testBox, logBox}) | flex;
+    // "Now testing" status line — shown between test panel and log
+    Element testingRow = nowTesting.empty()
+        ? (text("") | size(HEIGHT, EQUAL, 0))
+        : hbox({text(" ↗ Now testing: ") | bold | color(Color::Cyan),
+                text(nowTesting) | bold | color(Color::Yellow)});
+
+    auto rightCol = vbox({actionsBox, testBox, testingRow, logBox}) | flex;
 
     // ── Bottom bar ────────────────────────────────────────────────────────
     auto bar = hbox({
-        kd("Tab",      "panel"),
-        kd("1-6",      "action"),
+        kd("1-4",      "panel"),
+        kd("Tab",      "cycle"),
         kd("↑↓←→",   "navigate"),
         kd("Enter",    "run/stop"),
         kd("A",        "test all"),
@@ -339,17 +355,13 @@ int main() {
       return true;
     }
 
-    // ── Global: number keys 1-6 jump to that action ────────────────────────
+    // ── Global: number keys 1-4 switch panels ─────────────────────────────
     // Guard: don't steal keys from text input
     if (focus != 2) {
-      for (int i = 0; i < static_cast<int>(kActions.size()); ++i) {
-        if (ev == Event::Character(static_cast<char>('1' + i))) {
-          act   = i;
-          focus = 1;
-          syncFt();
-          return true;
-        }
-      }
+      if (ev == Event::Character('1')) { focus = 0; syncFt(); return true; }
+      if (ev == Event::Character('2')) { focus = 1; syncFt(); return true; }
+      if (ev == Event::Character('3')) { focus = 3; syncFt(); return true; }
+      if (ev == Event::Character('4')) { focus = 4; syncFt(); return true; }
     }
 
     // ── Global: kill all ────────────────────────────────────────────────────
@@ -373,6 +385,7 @@ int main() {
       if      (focus == 0)                     focus = 1;
       else if (focus == 1 && act == MOCK_IDX)  focus = 2;
       else if (focus == 1 || focus == 2)        focus = 3;
+      else if (focus == 3)                      focus = 4;
       else                                      focus = 0;
       syncFt();
       return true;
@@ -429,7 +442,7 @@ int main() {
     }
   });
 
-  logPush("tui", "Ready. 1-6 jump to action, Tab switches panels, Enter runs/stops.");
+  logPush("tui", "Ready. 1-4 switch panel, Tab cycles, ↑↓ navigate, Enter runs/stops.");
   screen.Loop(withEvents);
 
   bgStop = true;

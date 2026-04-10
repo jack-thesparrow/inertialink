@@ -1,6 +1,7 @@
 #pragma once
 #include "pen/io.hpp"
 #include <glm/glm.hpp>
+#include <string>
 #include <vector>
 
 struct GLFWwindow;
@@ -33,6 +34,10 @@ private:
   IMUData  prevIMU;
   bool     prevIMUValid{false};
   IMUData  cubeAnchor;           // IMU angles at stroke start; cube rotates relative to this
+
+  // Word title polling
+  int         frameCount{0};
+  std::string activeWord;        // last word read from /tmp/inertialink_word
 
   void initOpenGL();
   void setupGeometry();

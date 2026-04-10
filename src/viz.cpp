@@ -5,7 +5,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <cstdio>
 #include <iostream>
+#include <string>
 
 namespace pen {
 
@@ -198,6 +200,26 @@ void Visualizer::setupGeometry() {
 }
 
 void Visualizer::drawCube(const IMUData &imu) {
+  // ── Word title polling (every 60 frames ≈ 600 ms at 100 Hz) ──────────────
+  // mock_esp32.py writes the current word to /tmp/inertialink_word.
+  // We poll it here so the window title always reflects the word being tested.
+  if (++frameCount % 60 == 0) {
+    std::FILE *wf = std::fopen("/tmp/inertialink_word", "r");
+    if (wf) {
+      char buf[64] = {};
+      std::fgets(buf, sizeof(buf), wf);
+      std::fclose(wf);
+      std::string word(buf);
+      while (!word.empty() && (word.back() == '\n' || word.back() == '\r'))
+        word.pop_back();
+      if (!word.empty() && word != activeWord) {
+        activeWord = word;
+        std::string title = "Inertialink Visualizer  —  " + activeWord;
+        glfwSetWindowTitle(window, title.c_str());
+      }
+    }
+  }
+
   // ── New-stroke detection ──────────────────────────────────────────────────
   // An accel_z spike (same threshold as data_collector and decoder) signals
   // pen-on-paper impact.  On detection: clear the canvas trail and reset the

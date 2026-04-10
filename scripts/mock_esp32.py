@@ -70,6 +70,13 @@ def simulate_word(word: str, sample: str = "random") -> None:
             print(f"[Error] {filepath} not found.")
             return
 
+    # Advertise current word so visualizer and TUI can display it.
+    try:
+        with open("/tmp/inertialink_word", "w") as _wf:
+            _wf.write(word)
+    except OSError:
+        pass
+
     print(f"\n[Hardware] Target word : \"{word}\"  ← compare to AI prediction")
     print(f"[Hardware] Sample file : {filepath}")
 
