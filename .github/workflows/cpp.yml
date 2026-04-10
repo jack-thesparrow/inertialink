@@ -1,0 +1,35 @@
+name: C++ Build
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ninja-build \
+            libx11-dev libwayland-dev libxkbcommon-dev \
+            libgl1-mesa-dev
+
+      # FetchContent downloads GLFW, GLM, and ONNX Runtime at configure time.
+      # Cache the _deps folder so subsequent runs skip the download step.
+      - name: Cache FetchContent downloads
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: cmake-deps-${{ hashFiles('third_party/CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)

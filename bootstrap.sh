@@ -28,15 +28,21 @@ fi
 # --- 2. PYTHON VIRTUAL ENVIRONMENT ---
 echo ""
 echo "[+] Setting up Python Virtual Environment..."
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
-  echo "    Created .venv folder."
+# Use the system Python explicitly — avoids a "nested venv" crash that occurs
+# when bootstrap.sh is run from inside an already-activated virtual environment
+# (PATH would resolve python3 to .venv/bin/python3, which can fail on some
+# distros when creating a new venv with it).
+SYSPY=/usr/bin/python3
+if [ ! -d ".venv" ] || ! ./.venv/bin/python3 -c "" 2>/dev/null; then
+  echo "    Creating fresh .venv..."
+  rm -rf .venv
+  "$SYSPY" -m venv .venv
 else
-  echo "    .venv already exists."
+  echo "    .venv already exists and is functional."
 fi
 
 echo "[+] Installing Python dependencies from requirements.txt..."
-./.venv/bin/pip install --upgrade pip
+./.venv/bin/pip install --upgrade pip --quiet
 ./.venv/bin/pip install -r requirements.txt
 echo "    Dependencies installed."
 
@@ -100,7 +106,13 @@ else
   echo "    UDEV rules already installed."
 fi
 
-# --- 6. PRE-COMPILE ESP32 FIRMWARE ---
+# --- 6. CONFIGURE CMAKE ---
+echo ""
+echo "[+] Configuring CMake build system..."
+cmake -B build -G Ninja
+echo "    Build configured. Run: cmake --build build"
+
+# --- 7. PRE-COMPILE ESP32 FIRMWARE ---
 echo ""
 echo "[+] Pre-compiling ESP32 Firmware (This will take a while)..."
 if [ -d "esp32_firmware" ]; then
@@ -111,7 +123,7 @@ else
   echo "    [!] Directory 'esp32_firmware' not found. Skipping pre-compile."
 fi
 
-# --- 7. NEXT STEPS & TROUBLESHOOTING SUMMARY ---
+# --- 8. NEXT STEPS & TROUBLESHOOTING SUMMARY ---
 echo ""
 echo "========================================"
 echo " SETUP COMPLETE - NEXT STEPS"
@@ -121,6 +133,7 @@ echo "[+] ENVIRONMENT ACTIVATION:"
 echo "    To begin development, manually activate your tools:"
 echo "    1. Python Sandbox:  source .venv/bin/activate"
 echo "    2. PlatformIO CLI:  source ~/.bashrc (or ~/.zshrc)"
+echo "    3. Build C++:       cmake --build build"
 echo ""
 echo "--- COMMON ISSUES ---"
 
@@ -144,6 +157,6 @@ echo "    Reason: You are using the global Linux Python instead of the sandbox."
 echo "    Fix: Run 'source .venv/bin/activate' before running Python scripts."
 echo ""
 echo "[!] CMAKE ERROR: 'Could not find compile_commands.json'"
-echo "    Reason: The Neovim symlink hasn't been generated yet."
-echo "    Fix: Run 'cmake -B build/' to generate it."
+echo "    Reason: bootstrap.sh configures cmake automatically, but if it"
+echo "    failed, run: cmake -B build -G Ninja"
 echo "========================================"
