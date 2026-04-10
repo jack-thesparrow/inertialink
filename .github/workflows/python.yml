@@ -1,0 +1,56 @@
+name: Python Check
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Fast job — no deps needed, catches syntax errors in seconds.
+  syntax:
+    name: Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile-check all scripts
+        run: |
+          python3 -m py_compile scripts/mock_esp32.py
+          python3 -m py_compile scripts/train_bilstm.py
+          python3 -m py_compile scripts/eval_model.py
+          python3 -m py_compile scripts/generate_synthetic_data.py
+
+  # Slower job — installs full requirements and verifies every import resolves.
+  imports:
+    name: Imports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify all imports resolve
+        run: |
+          python3 - <<'EOF'
+          import torch
+          import pandas
+          import numpy
+          import onnxruntime
+          import scipy
+          import sklearn
+          print("All imports OK")
+          print(f"  torch         {torch.__version__}")
+          print(f"  onnxruntime   {onnxruntime.__version__}")
+          print(f"  pandas        {pandas.__version__}")
+          EOF
