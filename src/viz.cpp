@@ -184,33 +184,51 @@ void Visualizer::setupGeometry() {
 }
 
 void Visualizer::drawCube(const IMUData &imu) {
+  // ── New-stroke detection ──────────────────────────────────────────────────
+  // An accel_z spike (same threshold as data_collector and decoder) signals
+  // pen-on-paper impact.  On detection: clear the canvas trail and reset the
+  // cube anchor so the cube shows rotation *relative to the grip at stroke
+  // start* rather than the absolute IMU orientation.
+  if (prevIMUValid) {
+    float z_shock = std::abs(imu.accel_z - prevIMU.accel_z);
+    if (z_shock > pen::Defaults::wakeThresholdZ) {
+      strokeTrail.clear();   // strokeAnchor resets on next point (see below)
+      cubeAnchor = imu;      // cube neutral = current grip angle
+    }
+  } else {
+    cubeAnchor = imu;        // first frame: treat as anchor immediately
+  }
+  prevIMU      = imu;
+  prevIMUValid = true;
+
   int width, height;
   glfwGetFramebufferSize(window, &width, &height);
   int halfWidth = width / 2;
 
-  // Clear the ENTIRE window once
   glViewport(0, 0, width, height);
   glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-  // Both sides will share this camera setup, adjusted for the half-screen
-  // aspect ratio
   glm::mat4 view =
       glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.0f));
   glm::mat4 projection = glm::perspective(
       glm::radians(45.0f), (float)halfWidth / (float)height, 0.1f, 100.0f);
 
   // ==========================================
-  // LEFT VIEWPORT: 3D Spinning Cube
+  // LEFT VIEWPORT: 3D Cube (relative rotation)
   // ==========================================
-  glViewport(0, 0, halfWidth,
-             height); // Tell OpenGL to only draw on the left half
+  glViewport(0, 0, halfWidth, height);
+
+  // Rotate by delta from the anchor set at stroke start, so the cube sits at
+  // neutral when the pen first touches paper and shows only the writing motion.
+  float dYaw   = imu.yaw   - cubeAnchor.yaw;
+  float dPitch = imu.pitch - cubeAnchor.pitch;
+  float dRoll  = imu.roll  - cubeAnchor.roll;
 
   glm::mat4 cubeModel = glm::mat4(1.0f);
-  // The cube stays centered and just spins to show orientation
-  cubeModel = glm::rotate(cubeModel, imu.yaw, glm::vec3(0.0f, 1.0f, 0.0f));
-  cubeModel = glm::rotate(cubeModel, imu.pitch, glm::vec3(1.0f, 0.0f, 0.0f));
-  cubeModel = glm::rotate(cubeModel, imu.roll, glm::vec3(0.0f, 0.0f, 1.0f));
+  cubeModel = glm::rotate(cubeModel, dYaw,   glm::vec3(0.0f, 1.0f, 0.0f));
+  cubeModel = glm::rotate(cubeModel, dPitch, glm::vec3(1.0f, 0.0f, 0.0f));
+  cubeModel = glm::rotate(cubeModel, dRoll,  glm::vec3(0.0f, 0.0f, 1.0f));
 
   glm::mat4 cubeMVP = projection * view * cubeModel;
 
@@ -233,8 +251,9 @@ void Visualizer::drawCube(const IMUData &imu) {
   // Lever-arm projection — identical physics to data_collector and decoder.
   //   x_mm = -yaw_rad  * leverArmMm
   //   y_mm =  pitch_rad * leverArmMm
-  // Scale: 100 mm of pen travel = 1.0 GL unit, so a typical word fits well.
-  constexpr float MM_TO_GL = 1.0f / 100.0f;
+  // Scale: 200 mm of pen travel = 1.0 GL unit; with ortho ±1.5 that gives
+  // ±300 mm of visible range — enough for the widest trained words.
+  constexpr float MM_TO_GL = 1.0f / 200.0f;
   glm::vec3 pt(
       -imu.yaw   * pen::Defaults::leverArmMm * MM_TO_GL,
        imu.pitch * pen::Defaults::leverArmMm * MM_TO_GL,

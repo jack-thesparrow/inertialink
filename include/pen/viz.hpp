@@ -27,7 +27,12 @@ private:
   unsigned int trailShaderProgram;
   unsigned int trailVAO, trailVBO;
   std::vector<glm::vec3> strokeTrail;
-  glm::vec3 strokeAnchor{0.0f};   // first point of current stroke; trail is relative to this
+  glm::vec3 strokeAnchor{0.0f};  // trail origin — stroke is stored relative to this
+
+  // Stroke detection state
+  IMUData  prevIMU;
+  bool     prevIMUValid{false};
+  IMUData  cubeAnchor;           // IMU angles at stroke start; cube rotates relative to this
 
   void initOpenGL();
   void setupGeometry();

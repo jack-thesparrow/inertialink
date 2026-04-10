@@ -108,6 +108,11 @@ UDPReader::UDPReader(int port) : sockfd(-1), active(false) {
   if (sockfd < 0)
     return;
 
+  // SO_REUSEPORT lets multiple processes (e.g. decoder + visualizer) bind the
+  // same UDP port and each receive every packet independently.
+  int reuse = 1;
+  setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+
   struct sockaddr_in servaddr;
   memset(&servaddr, 0, sizeof(servaddr));
   servaddr.sin_family = AF_INET;
