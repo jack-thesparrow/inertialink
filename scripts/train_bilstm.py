@@ -264,7 +264,49 @@ class EpochPrefetcher:
 
 
 # ---------------------------------------------------------
-# 5. LR SCHEDULE
+# 5. TRAINING LOG HELPERS
+# ---------------------------------------------------------
+def _now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _log_session_start(start_epoch: int) -> None:
+    """Write a SESSION START marker.
+
+    First checks whether the previous session ended with a SESSION END marker.
+    If not (power cut, force restart, OOM kill), it writes a SESSION KILLED
+    line so the log always explains every gap.
+    """
+    os.makedirs("models", exist_ok=True)
+    needs_header = not os.path.exists(LOG_PATH)
+
+    if not needs_header:
+        # Scan backward for the last non-blank line
+        with open(LOG_PATH) as f:
+            lines = [l.rstrip() for l in f if l.strip()]
+        if lines and lines[-1].startswith("--- SESSION START"):
+            # Previous run had no SESSION END → was killed externally
+            with open(LOG_PATH, "a") as f:
+                f.write(f"--- SESSION KILLED | detected {_now()} ---\n")
+
+    with open(LOG_PATH, "a") as f:
+        if needs_header:
+            f.write("epoch,loss,best_loss,lr,no_improve,timestamp\n")
+        action = f"resuming from epoch {start_epoch}" if start_epoch > 0 else "fresh start"
+        f.write(f"--- SESSION START | {_now()} | {action} ---\n")
+
+
+def _log_session_end(reason: str, best_loss: float, epoch: int) -> None:
+    """Write a SESSION END marker with the reason training stopped."""
+    with open(LOG_PATH, "a") as f:
+        f.write(
+            f"--- SESSION END | {reason} | "
+            f"stopped at epoch {epoch} | best_loss={best_loss:.6f} | {_now()} ---\n"
+        )
+
+
+# ---------------------------------------------------------
+# 6. LR SCHEDULE
 # ---------------------------------------------------------
 def get_lr(epoch: int, total_epochs: int, warmup: int, base_lr: float) -> float:
     """Linear warm-up then cosine annealing to 5 % of base_lr."""
@@ -360,6 +402,9 @@ def train_and_export():
         bw = ckpt.get("best_weights")
         best_weights = _clean(bw) if bw is not None else None
         print(f"[Checkpoint] Resuming at epoch {start_epoch}, best loss {best_loss:.4f}")
+
+    # Write SESSION START (also detects previous kill and notes it in the log)
+    _log_session_start(start_epoch)
 
     # Keep a reference to the raw (uncompiled) model for ONNX export later.
     # torch.onnx.export uses jit.trace which conflicts with dynamo-compiled models.
@@ -501,14 +546,22 @@ def train_and_export():
             if no_improve >= PATIENCE:
                 print(f"\n[Early stop] No improvement for {PATIENCE} epochs. Best loss: {best_loss:.4f}")
                 training_complete = True
+                _log_session_end("early stop", best_loss, epoch + 1)
                 break
+
+        else:
+            # for-loop completed all EPOCHS without a break — not caught by early stop
+            training_complete = True
+            _log_session_end("all epochs done", best_loss, EPOCHS)
 
     except KeyboardInterrupt:
         print(f"\n\n[Interrupted] ", end="")
         if best_weights is None:
             print("No epoch completed — nothing to export. Re-run and let at least 1 epoch finish.")
+            _log_session_end("ctrl+c (no weights)", float("inf"), start_epoch)
             prefetcher.stop()
             return
+        _log_session_end(f"ctrl+c", best_loss, epoch + 1)
         print(f"Exporting model at best loss {best_loss:.4f} (checkpoint kept — re-run to continue training) ...")
 
     finally:
