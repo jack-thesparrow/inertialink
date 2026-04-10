@@ -546,13 +546,13 @@ def train_and_export():
             if no_improve >= PATIENCE:
                 print(f"\n[Early stop] No improvement for {PATIENCE} epochs. Best loss: {best_loss:.4f}")
                 training_complete = True
-                _log_session_end("early stop", best_loss, epoch + 1)
+                _log_session_end("completed normally — early stop", best_loss, epoch + 1)
                 break
 
         else:
             # for-loop completed all EPOCHS without a break — not caught by early stop
             training_complete = True
-            _log_session_end("all epochs done", best_loss, EPOCHS)
+            _log_session_end("completed normally — all epochs done", best_loss, EPOCHS)
 
     except KeyboardInterrupt:
         print(f"\n\n[Interrupted] ", end="")
