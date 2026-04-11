@@ -213,24 +213,31 @@ void Visualizer::setupGeometry() {
 }
 
 void Visualizer::drawCube(const IMUData &imu) {
-  // ── Word title polling (every 60 frames ≈ 600 ms at 100 Hz) ──────────────
-  // mock_esp32.py writes the current word to /tmp/inertialink_word.
-  // We poll it here so the window title always reflects the word being tested.
+  // ── HUD polling (every 60 frames ≈ 600 ms at 100 Hz) ────────────────────
+  // mock_esp32.py  writes /tmp/inertialink_word  before each stream.
+  // decoder_main   writes /tmp/inertialink_mode  at each state transition.
   if (++frameCount % 60 == 0) {
-    std::FILE *wf = std::fopen("/tmp/inertialink_word", "r");
-    if (wf) {
+    auto readTmpFile = [](const char *path, std::string &out) {
+      std::FILE *f = std::fopen(path, "r");
+      if (!f) return;
       char buf[64] = {};
-      std::fgets(buf, sizeof(buf), wf);
-      std::fclose(wf);
-      std::string word(buf);
-      while (!word.empty() && (word.back() == '\n' || word.back() == '\r'))
-        word.pop_back();
-      if (!word.empty() && word != activeWord) {
-        activeWord = word;
-        std::string title = "Inertialink Visualizer  —  " + activeWord;
-        glfwSetWindowTitle(window, title.c_str());
-      }
+      std::fgets(buf, sizeof(buf), f);
+      std::fclose(f);
+      out = buf;
+      while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+        out.pop_back();
+    };
+
+    std::string word, mode;
+    readTmpFile("/tmp/inertialink_word", word);
+    readTmpFile("/tmp/inertialink_mode", mode);
+
+    if (!word.empty() && word != activeWord) {
+      activeWord = word;
+      std::string title = "Inertialink Visualizer  —  " + activeWord;
+      glfwSetWindowTitle(window, title.c_str());
     }
+    activeMode = mode;
   }
 
   // ── New-stroke detection ──────────────────────────────────────────────────
@@ -353,37 +360,53 @@ void Visualizer::drawCube(const IMUData &imu) {
   glLineWidth(4.0f);
   glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(strokeTrail.size()));
 
-  // ── Word label below the stroke canvas ──────────────────────────────────
-  if (!activeWord.empty())
-    renderWord(activeWord, halfWidth, height);
+  // ── Word + mode HUD at the bottom of the canvas ─────────────────────────
+  // Layout (y increases downward, y=0 = top of viewport):
+  //   mode line  — above word, cyan (reading) or yellow (predicting)
+  //   word line  — near bottom, white
+  constexpr float kS = 2.5f;   // label scale (stb units → screen px)
+  if (!activeWord.empty()) {
+    float wW = static_cast<float>(
+        stb_easy_font_width(const_cast<char *>(activeWord.c_str())));
+    float tx = (halfWidth - wW * kS) * 0.5f;
+    float ty = height - kS * 12.0f - 6.0f;
+    renderText(activeWord, tx, ty, 1.0f, 1.0f, 1.0f, halfWidth, height);
+  }
+  if (!activeMode.empty() && activeMode != "idle") {
+    float mW = static_cast<float>(
+        stb_easy_font_width(const_cast<char *>(activeMode.c_str())));
+    float mtx = (halfWidth - mW * kS) * 0.5f;
+    float mty = height - kS * 12.0f * 2.5f - 8.0f;  // one line above word
+    bool predicting = (activeMode.rfind("Predict", 0) == 0);
+    float cr = predicting ? 1.0f : 0.2f;
+    float cg = predicting ? 0.9f : 1.0f;
+    float cb = predicting ? 0.2f : 0.4f;
+    renderText(activeMode, mtx, mty, cr, cg, cb, halfWidth, height);
+  }
 }
 
-void Visualizer::renderWord(const std::string &word, int vpWidth, int vpHeight) {
-  // stb_easy_font generates quads (4 verts × 16 bytes each = 64 bytes/quad).
-  // GL Core Profile doesn't support GL_QUADS, so we convert each quad to
-  // two triangles (6 vertices) and upload as plain x,y,z float triples.
+void Visualizer::renderText(const std::string &str, float tx, float ty,
+                            float cr, float cg, float cb,
+                            int vpWidth, int vpHeight) {
+  // stb_easy_font generates quads (4 verts × 16 bytes = 64 bytes/quad).
+  // GL Core Profile removed GL_QUADS — convert each quad to two triangles.
   static char stbBuf[32 * 1024];
-  // const_cast is safe: stb only reads the string
   int numQuads = stb_easy_font_print(
-      0.0f, 0.0f, const_cast<char *>(word.c_str()),
+      0.0f, 0.0f, const_cast<char *>(str.c_str()),
       nullptr, stbBuf, static_cast<int>(sizeof(stbBuf)));
   if (numQuads <= 0) return;
 
   std::vector<float> verts;
   verts.reserve(static_cast<std::size_t>(numQuads) * 6 * 3);
   for (int q = 0; q < numQuads; ++q) {
-    const int base = q * 64;  // 4 verts × 16 bytes
+    const int base = q * 64;
     float qx[4], qy[4];
     for (int v = 0; v < 4; ++v) {
-      // stb vertex layout: float x, float y, float z, uint8[4] color
       qx[v] = *reinterpret_cast<const float *>(stbBuf + base + v * 16 + 0);
       qy[v] = *reinterpret_cast<const float *>(stbBuf + base + v * 16 + 4);
     }
-    // Two CCW triangles from the quad: 0-1-2 and 0-2-3
     auto push = [&](int i) {
-      verts.push_back(qx[i]);
-      verts.push_back(qy[i]);
-      verts.push_back(0.0f);
+      verts.push_back(qx[i]); verts.push_back(qy[i]); verts.push_back(0.0f);
     };
     push(0); push(1); push(2);
     push(0); push(2); push(3);
@@ -395,28 +418,20 @@ void Visualizer::renderWord(const std::string &word, int vpWidth, int vpHeight) 
                static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
                verts.data(), GL_DYNAMIC_DRAW);
 
-  // Scale and center at the bottom of the canvas.
-  // stb renders at ~7 px/char wide, 12 px/char tall.
-  // A scale of 2.5 gives readable ~30 px tall characters.
-  constexpr float kScale = 2.5f;
-  float textW = static_cast<float>(
-      stb_easy_font_width(const_cast<char *>(word.c_str())));
-  float tx    = (vpWidth - textW * kScale) * 0.5f;  // centred horizontally
-  float ty    = vpHeight - kScale * 12.0f - 6.0f;   // 6 px margin from bottom
-
-  // Pixel-space ortho: x right, y down (matches stb's coordinate convention).
+  // Pixel-space ortho (y down = stb convention).  Scale by kLabelScale so
+  // characters are readable (~30 px tall) rather than the default ~12 px.
+  constexpr float kLabelScale = 2.5f;
   glm::mat4 proj  = glm::ortho(0.0f, static_cast<float>(vpWidth),
                                 static_cast<float>(vpHeight), 0.0f,
                                 -1.0f, 1.0f);
   glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(tx, ty, 0.0f))
-                  * glm::scale(glm::mat4(1.0f), glm::vec3(kScale, kScale, 1.0f));
+                  * glm::scale(glm::mat4(1.0f),
+                               glm::vec3(kLabelScale, kLabelScale, 1.0f));
 
   glUseProgram(trailShaderProgram);
   glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"),
                      1, GL_FALSE, glm::value_ptr(proj * model));
-  // Bright cyan — distinct from the orange trail, visible on the dark bg
-  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"),
-              0.3f, 1.0f, 0.9f);
+  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"), cr, cg, cb);
 
   glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size() / 3));
 }

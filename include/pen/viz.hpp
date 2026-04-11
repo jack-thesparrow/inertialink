@@ -35,15 +35,19 @@ private:
   bool     prevIMUValid{false};
   IMUData  cubeAnchor;           // IMU angles at stroke start; cube rotates relative to this
 
-  // Word title polling
+  // HUD state (polled from /tmp/inertialink_word and /tmp/inertialink_mode)
   int         frameCount{0};
-  std::string activeWord;        // last word read from /tmp/inertialink_word
+  std::string activeWord;
+  std::string activeMode;
 
   // Text rendering (stb_easy_font quads → triangles)
   unsigned int textVAO{0}, textVBO{0};
 
   void initOpenGL();
   void setupGeometry();
-  void renderWord(const std::string &word, int vpWidth, int vpHeight);
+  // Render `str` at viewport pixel position (tx, ty) scaled by kLabelScale,
+  // coloured (cr, cg, cb).  vpWidth/vpHeight are the current viewport dims.
+  void renderText(const std::string &str, float tx, float ty,
+                  float cr, float cg, float cb, int vpWidth, int vpHeight);
 };
 } // namespace pen

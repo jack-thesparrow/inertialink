@@ -70,10 +70,12 @@ def simulate_word(word: str, sample: str = "random") -> None:
             print(f"[Error] {filepath} not found.")
             return
 
-    # Advertise current word so visualizer and TUI can display it.
+    # Advertise current word and mode so visualizer and TUI can display them.
     try:
         with open("/tmp/inertialink_word", "w") as _wf:
             _wf.write(word)
+        with open("/tmp/inertialink_mode", "w") as _mf:
+            _mf.write("Reading stroke")
     except OSError:
         pass
 
@@ -101,6 +103,11 @@ def simulate_word(word: str, sample: str = "random") -> None:
         broadcast(idle_msg)
         time.sleep(0.01)
 
+    try:
+        with open("/tmp/inertialink_mode", "w") as _mf:
+            _mf.write("idle")
+    except OSError:
+        pass
     print("[Hardware] Simulation complete.\n")
 
 
@@ -129,10 +136,19 @@ if __name__ == "__main__":
     elif args[0] in ("-h", "--help"):
         print_usage()
 
-    else:
-        word   = args[0]
-        sample = args[1] if len(args) > 1 else "random"
+    elif len(args) == 2 and args[1].isdigit():
+        # Single word with explicit sample number: mock_esp32.py hello 3
+        word, sample = args[0], args[1]
         if word not in TRAINED_WORDS:
-            print(f"[Warning] '{word}' was not in training data — prediction may be wrong.")
-            print(f"Trained words: {', '.join(TRAINED_WORDS)}")
+            print(f"[Warning] '{word}' not in training data.")
         simulate_word(word, sample)
+
+    else:
+        # One or more words, random sample each (used by TUI "A" with marked words).
+        words_to_run = args
+        for word in words_to_run:
+            if word not in TRAINED_WORDS:
+                print(f"[Warning] '{word}' not in training data — prediction may be wrong.")
+            simulate_word(word, "random")
+            if len(words_to_run) > 1:
+                time.sleep(1.0)

@@ -5,20 +5,22 @@
 //
 // Panels  (Tab cycles through them):
 //   0  Connection   — Radiobox: WiFi / USB / Bluetooth / Simulation
-//   1  Actions      — 6 tools; ↑↓ navigate, Enter run/stop
-//   2  Mock input   — word / 'all' text field (only reachable when Mock ESP32 selected)
-//   3  Test panel   — 12-word grid; ↑↓←→ navigate, Enter stream, A stream all
-//   4  Output/Log   — scrollable output from all processes
+//   1  Actions      — 6 tools; ↑↓ navigate, Space/Enter toggle run·stop
+//   2  Mock input   — word / 'all' text field (only when Mock ESP32 on cursor)
+//   3  Test panel   — 12-word grid; ↑↓←→ navigate, Space mark, Enter stream, A all
+//   4  Output/Log   — per-process output sections, auto-split by active processes
 //
 // Key map (global):
 //   1-4          switch panel (Connection / Actions / Test / Output)
 //   Tab          cycle panels
 //   ↑↓ / ←→     navigate within focused panel
-//   Enter        launch / stop  (actions)  or  stream word  (test panel)
-//   A            stream all words  (test panel only)
+//   Space        run/stop action  |  mark/unmark word for batch test
+//   Enter        run/stop action  |  stream highlighted word immediately
+//   A            stream marked words  (all 12 if none marked)
 //   K            kill every running process
 //   C            clear the log
-//   PgUp/PgDn    scroll log
+//   PgUp/PgDn    scroll output
+//   ?            toggle keyboard-reference overlay
 //   Q            quit + SIGTERM all processes
 
 #include "pen/io.hpp"
@@ -26,6 +28,7 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/terminal.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -34,11 +37,13 @@
 #include <deque>
 #include <fcntl.h>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 using namespace ftxui;
@@ -143,7 +148,7 @@ int main() {
       {"./bin/decoder"}, true },
     { "Collector",  "Record IMU data to CSV",
       {"./bin/data_collector"}, true },
-    { "Mock ESP32", "",   // hint shows word dynamically
+    { "Mock ESP32", "",
       {".venv/bin/python3","scripts/mock_esp32.py"}, false },
     { "Train",      "BiLSTM CTC model training",
       {".venv/bin/python3","scripts/train_bilstm.py"}, false },
@@ -157,23 +162,22 @@ int main() {
       "hello","world","pen","123","write","note",
       "data","code","test","abc","xyz","open"
   };
-  static constexpr int WORD_COLS = 4;   // grid columns
-  int testWord = 0;                      // 0-11
+  static constexpr int WORD_COLS = 4;
+  int testWord = 0;
 
   // ── State ──────────────────────────────────────────────────────────────────
-  int act        = 0;
-  int focus      = 1;   // 0=conn, 1=actions, 2=mock-input, 3=test-panel, 4=log
-  int ftFocus    = 0;   // index into Container::Tab children
-  int logScroll  = 0;   // lines scrolled up from bottom
+  int  act       = 0;
+  int  focus     = 1;   // 0=conn 1=actions 2=mock-input 3=test 4=log
+  int  ftFocus   = 0;
+  int  logScroll = 0;
   std::vector<Proc> procs(kActions.size());
-  std::string mockWord    = "hello";
-  std::string nowTesting;  // set by streamWord(), shown above the log
+  std::string   mockWord    = "hello";
+  std::string   nowTesting;
+  std::set<int> selWords;   // test-panel words marked with Space
+  bool          showHelp    = false;
 
-  // Map our 4-panel focus to the two real FTXUI components
   auto syncFt = [&] {
     ftFocus = (focus == 0) ? 0 : (focus == 2) ? 1 : 0;
-    // When focus==1 or 3, neither FTXUI component owns the keyboard;
-    // CatchEvent handles it directly.
   };
   syncFt();
 
@@ -186,23 +190,31 @@ int main() {
     procs[i] = procLaunch(kActions[i].name, cmd);
   };
 
-  // Run mock with a specific word (stops current mock first)
+  // Stream a single word via mock_esp32
   auto streamWord = [&](const std::string &word) {
     if (procs[MOCK_IDX].alive) procStop(procs[MOCK_IDX]);
     auto cmd = kActions[MOCK_IDX].cmd;
     cmd.push_back(word);
-    procs[MOCK_IDX] = procLaunch("Mock:" + word, cmd);
+    procs[MOCK_IDX] = procLaunch("Mock", cmd);
     nowTesting = (word == "all") ? "all 12 words" : word;
+  };
+
+  // Stream a set of words (each as a separate argument; mock handles the list)
+  auto streamWords = [&](const std::vector<std::string> &words) {
+    if (procs[MOCK_IDX].alive) procStop(procs[MOCK_IDX]);
+    auto cmd = kActions[MOCK_IDX].cmd;
+    for (auto &w : words) cmd.push_back(w);
+    nowTesting = words.size() == 1
+        ? words[0]
+        : std::to_string(words.size()) + " selected words";
+    procs[MOCK_IDX] = procLaunch("Mock", cmd);
   };
 
   // ── FTXUI components ───────────────────────────────────────────────────────
   auto connRadio = Radiobox(&kConnLabels, &conn);
   auto mockInput = Input(&mockWord, "word / 'all'");
-
-  // Dummy focusable component to hold the actions/test focus slots
   auto dummyComp = Renderer([] { return text(""); });
-
-  auto layout = Container::Tab({connRadio, mockInput, dummyComp, dummyComp}, &ftFocus);
+  auto layout    = Container::Tab({connRadio, mockInput, dummyComp, dummyComp}, &ftFocus);
 
   // ── Renderer ───────────────────────────────────────────────────────────────
   auto ui = Renderer(layout, [&]() -> Element {
@@ -210,19 +222,17 @@ int main() {
     auto kd = [](const std::string &k, const std::string &desc) {
       return hbox({
           text(" " + k + " ") | bold | bgcolor(Color::Blue) | color(Color::White),
-          text(" " + desc + "  "),
+          text(" " + desc + " "),
       });
     };
-    // Panel title: yellow + bold when focused, plain when not.
+    // Panel title: yellow when focused, white otherwise.
     auto pTitle = [&](int panelFocus, const std::string &label) -> Element {
-      bool active = (focus == panelFocus);
-      return text(label) | bold | (active ? color(Color::Yellow) : color(Color::White));
+      return text(label) | bold
+           | ((focus == panelFocus) ? color(Color::Yellow) : color(Color::White));
     };
 
-    // ── Left: connection + status ─────────────────────────────────────────
-    auto connBox = window(
-        pTitle(0, " [1] Connection "),
-        connRadio->Render());
+    // ── Left column ───────────────────────────────────────────────────────────
+    auto connBox = window(pTitle(0, " [1] Connection "), connRadio->Render());
 
     Elements dotRows;
     for (int i = 0; i < static_cast<int>(kActions.size()); ++i) {
@@ -232,25 +242,22 @@ int main() {
       dotRows.push_back(hbox({dot, text(kActions[i].name)}));
     }
     auto statusBox = window(text(" Status ") | bold, vbox(std::move(dotRows)));
+    auto leftCol   = vbox({connBox, statusBox});
 
-    auto leftCol = vbox({connBox, statusBox});
-
-    // ── Right top: action list ────────────────────────────────────────────
+    // ── Actions panel ─────────────────────────────────────────────────────────
     Elements actRows;
     for (int i = 0; i < static_cast<int>(kActions.size()); ++i) {
-      bool sel     = (i == act) && (focus == 1);
-      auto numTag  = text(" " + std::to_string(i+1) + " ")
-                     | color(Color::Yellow) | bold;
-      auto tag     = procs[i].alive
+      bool sel    = (i == act) && (focus == 1);
+      auto numTag = text(" " + std::to_string(i+1) + " ") | color(Color::Yellow) | bold;
+      auto tag    = procs[i].alive
           ? (text(" STOP ") | color(Color::Red)   | bold)
           : (text(" RUN  ") | color(Color::Green) | bold);
-      std::string hintStr = (i == MOCK_IDX)
+      std::string hint = (i == MOCK_IDX)
           ? ("word: " + (mockWord.empty() ? "hello" : mockWord))
           : kActions[i].hint;
-
       auto row = hbox({numTag, tag, text("  "),
                        text(kActions[i].name) | size(WIDTH, EQUAL, 11),
-                       text("  "), text(hintStr) | dim});
+                       text("  "), text(hint) | dim});
       actRows.push_back(sel ? (row | inverted) : row);
     }
     auto mockRow = hbox({
@@ -259,104 +266,196 @@ int main() {
         text("  [Tab] to type") | dim,
     });
     auto actionsBox = window(
-        pTitle(1, " [2] Actions   ↑↓ navigate   Enter run·stop "),
+        pTitle(1, " [2] Actions   ↑↓ navigate   Space/Enter run·stop "),
         vbox({vbox(std::move(actRows)), separator(), mockRow}));
 
-    // ── Right middle: test panel ──────────────────────────────────────────
-    // 4-column grid of all 12 trained words
+    // ── Test panel ────────────────────────────────────────────────────────────
     Elements wordRows;
     int nWords = static_cast<int>(kWords.size());
     for (int row = 0; row * WORD_COLS < nWords; ++row) {
       Elements cols;
       for (int c = 0; c < WORD_COLS; ++c) {
-        int idx = row * WORD_COLS + c;
+        int  idx    = row * WORD_COLS + c;
         if (idx >= nWords) { cols.push_back(text("") | flex); continue; }
-        bool sel = (idx == testWord) && (focus == 3);
-        auto numStr = std::to_string(idx + 1);
-        auto cell = hbox({
-            text(numStr) | color(Color::Yellow) | size(WIDTH, EQUAL, 2),
+        bool cursor = (idx == testWord) && (focus == 3);
+        bool marked = selWords.count(idx) > 0;
+        auto mark   = marked ? (text("✓") | color(Color::Green) | bold) : text(" ");
+        auto cell   = hbox({
+            mark,
+            text(std::to_string(idx+1)) | color(Color::Yellow) | size(WIDTH, EQUAL, 2),
             text(" "),
             text(kWords[idx]) | size(WIDTH, EQUAL, 6),
-        }) | size(WIDTH, EQUAL, 11);
-        cols.push_back(sel ? (cell | inverted) : cell);
+        }) | size(WIDTH, EQUAL, 12);
+        cols.push_back(cursor ? (cell | inverted) : cell);
       }
       wordRows.push_back(hbox(std::move(cols)));
     }
     auto testBox = window(
-        pTitle(3, " [3] Test Model   ↑↓←→ navigate   Enter stream   A all "),
+        pTitle(3, " [3] Test   ↑↓←→ navigate   Space mark   Enter stream   A all "),
         vbox(std::move(wordRows)));
 
-    // ── Right bottom: log ─────────────────────────────────────────────────
-    Elements logRows;
+    // ── Per-process output sections ───────────────────────────────────────────
+    // Copy log data under the mutex, grouped by source in first-seen order.
+    struct SrcBuf { std::string name; std::vector<LogLine> lines; };
+    std::vector<SrcBuf> srcBufs;
     {
+      std::unordered_map<std::string, int> idx;
       std::lock_guard lk(gLogMtx);
-      int total   = static_cast<int>(gLog.size());
-      // clamp scroll within available range
-      logScroll   = std::min(logScroll, std::max(0, total - 1));
-      int visible = 12; // rough estimate; FTXUI fills the flex space naturally
-      int end     = total - logScroll;
-      int start   = std::max(0, end - visible);
-      for (int i = start; i < end; ++i) {
-        auto &l = gLog[i];
-        // Pad source to fixed width so columns align
-        std::string srcPad = l.src.substr(0, 12);
-        srcPad.resize(12, ' ');
-        logRows.push_back(hbox({
-            text(l.ts)    | color(Color::GrayDark),
-            text(" "),
-            text(srcPad)  | color(Color::Cyan),
-            text(" "),
-            text(l.msg),
+      for (auto &l : gLog) {
+        auto it = idx.find(l.src);
+        if (it == idx.end()) {
+          idx[l.src] = static_cast<int>(srcBufs.size());
+          srcBufs.push_back({l.src, {}});
+        }
+        srcBufs[idx[l.src]].lines.push_back(l);
+      }
+      logScroll = std::min(logScroll, std::max(0, static_cast<int>(gLog.size())-1));
+    }
+
+    // Separate "tui" system events (small header) from process outputs (flex sections).
+    SrcBuf *tuiBuf = nullptr;
+    std::vector<SrcBuf *> procBufs;
+    for (auto &sb : srcBufs) {
+      if (sb.name == "tui") tuiBuf = &sb;
+      else                  procBufs.push_back(&sb);
+    }
+
+    // Estimate lines available for the output zone based on terminal height.
+    auto termSz    = Terminal::Size();
+    int  outHeight = std::max(6, termSz.dimy - 22); // rows below actions+test+bars
+    int  numProcs  = std::max(1, static_cast<int>(procBufs.size()));
+    int  perProc   = std::max(2, outHeight / numProcs - 3); // -3 for border + title
+
+    Elements sections;
+
+    // System-events strip (last 2 "tui" lines, fixed, no flex)
+    if (tuiBuf && !tuiBuf->lines.empty()) {
+      auto &tl  = tuiBuf->lines;
+      int   tot = static_cast<int>(tl.size());
+      Elements sysRows;
+      for (int i = std::max(0, tot-2); i < tot; ++i)
+        sysRows.push_back(hbox({
+            text(tl[i].ts) | color(Color::GrayDark),
+            text("  "),
+            text(tl[i].msg) | dim | flex,
         }));
+      sections.push_back(hbox({
+          text(" sys ") | dim,
+          vbox(std::move(sysRows)) | flex,
+      }));
+    }
+
+    // One flex section per process that produced output.
+    if (procBufs.empty()) {
+      sections.push_back(
+          window(pTitle(4, " [4] Output "),
+                 text("Waiting for output...") | dim | center) | flex);
+    } else {
+      bool focusOutput = (focus == 4);
+      for (auto *sb : procBufs) {
+        int   tot   = static_cast<int>(sb->lines.size());
+        int   end   = std::max(0, tot - logScroll);
+        int   start = std::max(0, end - perProc);
+        Elements rows;
+        for (int i = start; i < end; ++i)
+          rows.push_back(hbox({
+              text(sb->lines[i].ts) | color(Color::GrayDark),
+              text(" "),
+              text(sb->lines[i].msg) | flex,
+          }));
+        if (rows.empty()) rows.push_back(text("(no output yet)") | dim);
+
+        Color titleColor = focusOutput ? Color::Yellow : Color::Cyan;
+        sections.push_back(
+            window(text(" " + sb->name + " ") | bold | color(titleColor),
+                   vbox(std::move(rows)) | flex) | flex);
       }
     }
-    if (logRows.empty())
-      logRows.push_back(text("Waiting for output...") | dim | center);
 
-    auto logBox = window(
-        pTitle(4, " [4] Output   PgUp/PgDn scroll   C clear "),
-        vbox(std::move(logRows))) | flex;
+    auto outputArea = vbox(std::move(sections)) | flex;
 
-    // "Now testing" status line — shown between test panel and log
+    // "Now testing" indicator between test panel and output
     Element testingRow = nowTesting.empty()
         ? (text("") | size(HEIGHT, EQUAL, 0))
         : hbox({text(" ↗ Now testing: ") | bold | color(Color::Cyan),
                 text(nowTesting) | bold | color(Color::Yellow)});
 
-    auto rightCol = vbox({actionsBox, testBox, testingRow, logBox}) | flex;
+    auto rightCol = vbox({actionsBox, testBox, testingRow, outputArea}) | flex;
 
-    // ── Bottom bar ────────────────────────────────────────────────────────
+    // ── Bottom bar ────────────────────────────────────────────────────────────
     auto bar = hbox({
-        kd("1-4",      "panel"),
-        kd("Tab",      "cycle"),
-        kd("↑↓←→",   "navigate"),
-        kd("Enter",    "run/stop"),
-        kd("A",        "test all"),
-        kd("K",        "kill all"),
-        kd("C",        "clear"),
-        kd("PgUp/Dn",  "scroll"),
-        kd("Q",        "quit"),
+        kd("1-4",     "panel"),
+        kd("Tab",     "cycle"),
+        kd("↑↓",      "nav"),
+        kd("Space",   "select"),
+        kd("Enter",   "run"),
+        kd("A",       "all"),
+        kd("K",       "kill"),
+        kd("C",       "clear"),
+        kd("PgUp/Dn", "scroll"),
+        kd("?",       "help"),
+        kd("Q",       "quit"),
     });
 
-    return vbox({
+    auto mainLayout = vbox({
         text(" ★  Inertialink Smart Pen") | bold | center,
         separator(),
         hbox({leftCol, separator(), rightCol}) | flex,
         separator(),
         bar,
     });
+
+    // ── Help overlay (dbox on top of main layout) ─────────────────────────────
+    if (!showHelp) return mainLayout;
+
+    auto helpBody = vbox({
+        text(" Keyboard Reference ") | bold | color(Color::Yellow) | center,
+        separator(),
+        hbox({text("  1-4       ") | bold | color(Color::Yellow),
+              text("Switch panel  Connection / Actions / Test / Output")}),
+        hbox({text("  Tab       ") | bold | color(Color::Yellow),
+              text("Cycle panels forward")}),
+        hbox({text("  ↑↓ / ←→  ") | bold | color(Color::Yellow),
+              text("Navigate within focused panel")}),
+        hbox({text("  Space     ") | bold | color(Color::Yellow),
+              text("Toggle run/stop (Actions)  |  mark/unmark word (Test)")}),
+        hbox({text("  Enter     ") | bold | color(Color::Yellow),
+              text("Toggle run/stop (Actions)  |  stream word (Test)")}),
+        hbox({text("  A         ") | bold | color(Color::Yellow),
+              text("Stream marked words, or all 12 if none marked")}),
+        hbox({text("  K         ") | bold | color(Color::Yellow),
+              text("Kill all running processes")}),
+        hbox({text("  C         ") | bold | color(Color::Yellow),
+              text("Clear output log")}),
+        hbox({text("  PgUp/PgDn ") | bold | color(Color::Yellow),
+              text("Scroll output")}),
+        hbox({text("  Q         ") | bold | color(Color::Yellow),
+              text("Quit  (SIGTERM all processes)")}),
+        hbox({text("  ?         ") | bold | color(Color::Yellow),
+              text("Toggle this help overlay")}),
+        separator(),
+        text("  Press any key to dismiss  ") | dim | center,
+    });
+    auto helpBox = window(text(""), helpBody) | clear_under | center;
+    return dbox({mainLayout, helpBox});
   });
 
   // ── Event handler ──────────────────────────────────────────────────────────
   auto withEvents = CatchEvent(ui, [&](Event ev) -> bool {
-    // ── Global: quit ───────────────────────────────────────────────────────
-    if (ev == Event::Character('q') || ev == Event::Character('Q')) {
-      screen.ExitLoopClosure()();
-      return true;
+    // Any key dismisses the help overlay.
+    if (showHelp) { showHelp = false; return true; }
+
+    // '?' opens help (guard: not while typing)
+    if (focus != 2 && ev == Event::Character('?')) {
+      showHelp = true; return true;
     }
 
-    // ── Global: number keys 1-4 switch panels ─────────────────────────────
-    // Guard: don't steal keys from text input
+    // ── Quit ─────────────────────────────────────────────────────────────────
+    if (ev == Event::Character('q') || ev == Event::Character('Q')) {
+      screen.ExitLoopClosure()(); return true;
+    }
+
+    // ── Panel switch 1-4 ─────────────────────────────────────────────────────
     if (focus != 2) {
       if (ev == Event::Character('1')) { focus = 0; syncFt(); return true; }
       if (ev == Event::Character('2')) { focus = 1; syncFt(); return true; }
@@ -364,69 +463,81 @@ int main() {
       if (ev == Event::Character('4')) { focus = 4; syncFt(); return true; }
     }
 
-    // ── Global: kill all ────────────────────────────────────────────────────
+    // ── Kill all ─────────────────────────────────────────────────────────────
     if (ev == Event::Character('k') || ev == Event::Character('K')) {
       for (auto &p : procs) if (p.alive) procStop(p);
       return true;
     }
 
-    // ── Global: clear log (not when typing) ────────────────────────────────
-    if (focus != 2 &&
-        (ev == Event::Character('c') || ev == Event::Character('C'))) {
-      std::lock_guard lk(gLogMtx); gLog.clear(); return true;
+    // ── Clear log ────────────────────────────────────────────────────────────
+    if (focus != 2 && (ev == Event::Character('c') || ev == Event::Character('C'))) {
+      std::lock_guard lk(gLogMtx); gLog.clear();
+      selWords.clear(); nowTesting.clear();
+      return true;
     }
 
-    // ── Global: log scroll ─────────────────────────────────────────────────
-    if (ev == Event::PageUp)   { logScroll += 5;                    return true; }
+    // ── Scroll ───────────────────────────────────────────────────────────────
+    if (ev == Event::PageUp)   { logScroll += 5;                      return true; }
     if (ev == Event::PageDown) { logScroll = std::max(0,logScroll-5); return true; }
 
-    // ── Tab: cycle panels ──────────────────────────────────────────────────
+    // ── Tab cycle ────────────────────────────────────────────────────────────
     if (ev == Event::Tab) {
       if      (focus == 0)                     focus = 1;
       else if (focus == 1 && act == MOCK_IDX)  focus = 2;
       else if (focus == 1 || focus == 2)        focus = 3;
       else if (focus == 3)                      focus = 4;
       else                                      focus = 0;
-      syncFt();
-      return true;
+      syncFt(); return true;
     }
 
-    // ── Actions panel (focus == 1) ─────────────────────────────────────────
+    // ── Actions panel ────────────────────────────────────────────────────────
     if (focus == 1) {
-      if (ev == Event::ArrowUp) {
-        act = std::max(0, act-1); return true;
-      }
+      if (ev == Event::ArrowUp)   { act = std::max(0, act-1); return true; }
       if (ev == Event::ArrowDown) {
         act = std::min(static_cast<int>(kActions.size())-1, act+1); return true;
       }
-      if (ev == Event::Return) { toggleAction(act); return true; }
+      // Space and Enter both toggle run/stop
+      if (ev == Event::Return || ev == Event::Character(' ')) {
+        toggleAction(act); return true;
+      }
     }
 
-    // ── Test panel (focus == 3) ────────────────────────────────────────────
+    // ── Test panel ───────────────────────────────────────────────────────────
     if (focus == 3) {
-      int nWords = static_cast<int>(kWords.size());
       int row    = testWord / WORD_COLS;
       int col    = testWord % WORD_COLS;
-      int maxRow = (nWords - 1) / WORD_COLS;
+      int maxRow = (static_cast<int>(kWords.size())-1) / WORD_COLS;
+      int nWords = static_cast<int>(kWords.size());
 
-      if (ev == Event::ArrowUp && row > 0) {
-        testWord -= WORD_COLS; return true;
+      if (ev == Event::ArrowUp    && row > 0)
+        { testWord -= WORD_COLS; return true; }
+      if (ev == Event::ArrowDown  && row < maxRow)
+        { testWord = std::min(nWords-1, testWord+WORD_COLS); return true; }
+      if (ev == Event::ArrowLeft  && col > 0)
+        { testWord -= 1; return true; }
+      if (ev == Event::ArrowRight && col < WORD_COLS-1 && testWord+1 < nWords)
+        { testWord += 1; return true; }
+
+      // Space: mark / unmark the current word
+      if (ev == Event::Character(' ')) {
+        if (selWords.count(testWord)) selWords.erase(testWord);
+        else selWords.insert(testWord);
+        return true;
       }
-      if (ev == Event::ArrowDown && row < maxRow) {
-        testWord = std::min(nWords-1, testWord + WORD_COLS); return true;
-      }
-      if (ev == Event::ArrowLeft && col > 0) {
-        testWord -= 1; return true;
-      }
-      if (ev == Event::ArrowRight && col < WORD_COLS-1 && testWord+1 < nWords) {
-        testWord += 1; return true;
-      }
+      // Enter: stream the highlighted word immediately
       if (ev == Event::Return) {
         streamWord(kWords[testWord]); return true;
       }
-      // 'A' — stream all words
+      // A: stream marked words, or all if nothing marked
       if (ev == Event::Character('a') || ev == Event::Character('A')) {
-        streamWord("all"); return true;
+        if (!selWords.empty()) {
+          std::vector<std::string> wl;
+          for (int w : selWords) wl.push_back(kWords[w]);
+          streamWords(wl);
+        } else {
+          streamWord("all");
+        }
+        return true;
       }
     }
 
@@ -442,7 +553,7 @@ int main() {
     }
   });
 
-  logPush("tui", "Ready. 1-4 switch panel, Tab cycles, ↑↓ navigate, Enter runs/stops.");
+  logPush("tui", "Ready.  1-4 panel | Tab cycle | Space select | Enter run | ? help | Q quit");
   screen.Loop(withEvents);
 
   bgStop = true;

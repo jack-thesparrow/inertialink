@@ -2,11 +2,20 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <onnxruntime_cxx_api.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// Write a short string to /tmp/inertialink_mode so the visualizer can show it.
+static void writeMode(const char *mode) {
+  if (std::FILE *f = std::fopen("/tmp/inertialink_mode", "w")) {
+    std::fputs(mode, f);
+    std::fclose(f);
+  }
+}
 
 // ML Input Format
 struct DataPoint {
@@ -264,9 +273,17 @@ void runAIInference(Ort::Session &session,
 // MAIN APPLICATION
 // ---------------------------------------------------------
 int main(int argc, char *argv[]) {
+  // Flush stdout immediately when piped (e.g. via the TUI).
+  // Without this, C++ cout uses block-buffering on non-tty fds and output
+  // only appears in the log pane when the buffer fills (~4 KB) or the
+  // process exits — making predictions invisible during a session.
+  std::cout.setf(std::ios::unitbuf);
+
   // Default to "wifi" so `./bin/decoder` works out-of-the-box with mock_esp32.py.
   // Use "usb" or "bt" for physical hardware.
   std::string mode = (argc > 1) ? argv[1] : "wifi";
+
+  writeMode("idle");
 
   // --- 1. INITIALIZE AI ENGINE ---
   std::cout << "[System] Booting ONNX Machine Learning Engine...\n";
@@ -332,6 +349,7 @@ int main(int argc, char *argv[]) {
 
   while (true) {
     std::cout << "\n[AI IDLE] Waiting for pen impact...\n";
+    writeMode("idle");
 
     // 1. WAKE-ON-IMPACT LOOP
     bool isWriting = false;
@@ -340,6 +358,7 @@ int main(int argc, char *argv[]) {
         if (std::abs(currentData.accel_z - prevData.accel_z) >
             WAKE_THRESHOLD_Z) {
           std::cout << "[AI ACTIVE] Impact detected. Reading stroke...\n";
+          writeMode("Reading stroke...");
           anchor = currentData;
           isWriting = true;
         }
@@ -376,6 +395,7 @@ int main(int argc, char *argv[]) {
         if ((elapsedMs - lastActiveTime) > IDLE_TIMEOUT_MS) {
           std::cout << "[AI PROCESSING] Idle timeout reached. Analyzing "
                     << strokeBuffer.size() << " frames...\n";
+          writeMode("Predicting...");
           isWriting = false;
         }
 
