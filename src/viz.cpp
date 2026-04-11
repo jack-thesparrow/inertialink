@@ -1,3 +1,5 @@
+#include "stb_easy_font.h"
+
 #include "pen/viz.hpp"
 #include <glad/glad.h>
 // glad before GLFW
@@ -5,7 +7,10 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <cstdio>
 #include <iostream>
+#include <string>
+#include <vector>
 
 namespace pen {
 
@@ -43,9 +48,10 @@ void main() {
 
 const char *trailFragmentShader = R"(
 #version 330 core
+uniform vec3 uColor;
 out vec4 FragColor;
 void main() {
-    FragColor = vec4(1.0, 0.6, 0.1, 1.0); // Bright Neon Orange
+    FragColor = vec4(uColor, 1.0);
 }
 )";
 
@@ -195,9 +201,45 @@ void Visualizer::setupGeometry() {
   glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void *)0);
   glEnableVertexAttribArray(0);
+
+  // --- Text Geometry Setup (dynamic; filled each frame by renderWord) ---
+  glGenVertexArrays(1, &textVAO);
+  glGenBuffers(1, &textVBO);
+  glBindVertexArray(textVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+  // 3 floats per vertex (x, y, z); stride = 3 * sizeof(float)
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
+  glEnableVertexAttribArray(0);
 }
 
 void Visualizer::drawCube(const IMUData &imu) {
+  // ── HUD polling (every 60 frames ≈ 600 ms at 100 Hz) ────────────────────
+  // mock_esp32.py  writes /tmp/inertialink_word  before each stream.
+  // decoder_main   writes /tmp/inertialink_mode  at each state transition.
+  if (++frameCount % 60 == 0) {
+    auto readTmpFile = [](const char *path, std::string &out) {
+      std::FILE *f = std::fopen(path, "r");
+      if (!f) return;
+      char buf[64] = {};
+      std::fgets(buf, sizeof(buf), f);
+      std::fclose(f);
+      out = buf;
+      while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+        out.pop_back();
+    };
+
+    std::string word, mode;
+    readTmpFile("/tmp/inertialink_word", word);
+    readTmpFile("/tmp/inertialink_mode", mode);
+
+    if (!word.empty() && word != activeWord) {
+      activeWord = word;
+      std::string title = "Inertialink Visualizer  —  " + activeWord;
+      glfwSetWindowTitle(window, title.c_str());
+    }
+    activeMode = mode;
+  }
+
   // ── New-stroke detection ──────────────────────────────────────────────────
   // An accel_z spike (same threshold as data_collector and decoder) signals
   // pen-on-paper impact.  On detection: clear the canvas trail and reset the
@@ -307,6 +349,8 @@ void Visualizer::drawCube(const IMUData &imu) {
   glUseProgram(trailShaderProgram);
   glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"), 1,
                      GL_FALSE, glm::value_ptr(ortho));
+  // Neon orange for the stroke trail
+  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"), 1.0f, 0.6f, 0.1f);
 
   glBindVertexArray(trailVAO);
   glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
@@ -315,6 +359,81 @@ void Visualizer::drawCube(const IMUData &imu) {
                strokeTrail.data(), GL_DYNAMIC_DRAW);
   glLineWidth(4.0f);
   glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(strokeTrail.size()));
+
+  // ── Word + mode HUD at the bottom of the canvas ─────────────────────────
+  // Layout (y increases downward, y=0 = top of viewport):
+  //   mode line  — above word, cyan (reading) or yellow (predicting)
+  //   word line  — near bottom, white
+  constexpr float kS = 2.5f;   // label scale (stb units → screen px)
+  if (!activeWord.empty()) {
+    float wW = static_cast<float>(
+        stb_easy_font_width(const_cast<char *>(activeWord.c_str())));
+    float tx = (halfWidth - wW * kS) * 0.5f;
+    float ty = height - kS * 12.0f - 6.0f;
+    renderText(activeWord, tx, ty, 1.0f, 1.0f, 1.0f, halfWidth, height);
+  }
+  if (!activeMode.empty() && activeMode != "idle") {
+    float mW = static_cast<float>(
+        stb_easy_font_width(const_cast<char *>(activeMode.c_str())));
+    float mtx = (halfWidth - mW * kS) * 0.5f;
+    float mty = height - kS * 12.0f * 2.5f - 8.0f;  // one line above word
+    bool predicting = (activeMode.rfind("Predict", 0) == 0);
+    float cr = predicting ? 1.0f : 0.2f;
+    float cg = predicting ? 0.9f : 1.0f;
+    float cb = predicting ? 0.2f : 0.4f;
+    renderText(activeMode, mtx, mty, cr, cg, cb, halfWidth, height);
+  }
+}
+
+void Visualizer::renderText(const std::string &str, float tx, float ty,
+                            float cr, float cg, float cb,
+                            int vpWidth, int vpHeight) {
+  // stb_easy_font generates quads (4 verts × 16 bytes = 64 bytes/quad).
+  // GL Core Profile removed GL_QUADS — convert each quad to two triangles.
+  static char stbBuf[32 * 1024];
+  int numQuads = stb_easy_font_print(
+      0.0f, 0.0f, const_cast<char *>(str.c_str()),
+      nullptr, stbBuf, static_cast<int>(sizeof(stbBuf)));
+  if (numQuads <= 0) return;
+
+  std::vector<float> verts;
+  verts.reserve(static_cast<std::size_t>(numQuads) * 6 * 3);
+  for (int q = 0; q < numQuads; ++q) {
+    const int base = q * 64;
+    float qx[4], qy[4];
+    for (int v = 0; v < 4; ++v) {
+      qx[v] = *reinterpret_cast<const float *>(stbBuf + base + v * 16 + 0);
+      qy[v] = *reinterpret_cast<const float *>(stbBuf + base + v * 16 + 4);
+    }
+    auto push = [&](int i) {
+      verts.push_back(qx[i]); verts.push_back(qy[i]); verts.push_back(0.0f);
+    };
+    push(0); push(1); push(2);
+    push(0); push(2); push(3);
+  }
+
+  glBindVertexArray(textVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+  glBufferData(GL_ARRAY_BUFFER,
+               static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+               verts.data(), GL_DYNAMIC_DRAW);
+
+  // Pixel-space ortho (y down = stb convention).  Scale by kLabelScale so
+  // characters are readable (~30 px tall) rather than the default ~12 px.
+  constexpr float kLabelScale = 2.5f;
+  glm::mat4 proj  = glm::ortho(0.0f, static_cast<float>(vpWidth),
+                                static_cast<float>(vpHeight), 0.0f,
+                                -1.0f, 1.0f);
+  glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(tx, ty, 0.0f))
+                  * glm::scale(glm::mat4(1.0f),
+                               glm::vec3(kLabelScale, kLabelScale, 1.0f));
+
+  glUseProgram(trailShaderProgram);
+  glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"),
+                     1, GL_FALSE, glm::value_ptr(proj * model));
+  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"), cr, cg, cb);
+
+  glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size() / 3));
 }
 
 } // namespace pen
