@@ -177,7 +177,9 @@ int main() {
   bool          showHelp    = false;
 
   auto syncFt = [&] {
-    ftFocus = (focus == 0) ? 0 : (focus == 2) ? 1 : 0;
+    if      (focus == 0) ftFocus = 0;  // connRadio receives keyboard
+    else if (focus == 2) ftFocus = 1;  // mockInput receives keyboard
+    else                 ftFocus = 2;  // dummyComp — won't steal arrow keys
   };
   syncFt();
 
@@ -509,14 +511,11 @@ int main() {
       int maxRow = (static_cast<int>(kWords.size())-1) / WORD_COLS;
       int nWords = static_cast<int>(kWords.size());
 
-      if (ev == Event::ArrowUp    && row > 0)
-        { testWord -= WORD_COLS; return true; }
-      if (ev == Event::ArrowDown  && row < maxRow)
-        { testWord = std::min(nWords-1, testWord+WORD_COLS); return true; }
-      if (ev == Event::ArrowLeft  && col > 0)
-        { testWord -= 1; return true; }
-      if (ev == Event::ArrowRight && col < WORD_COLS-1 && testWord+1 < nWords)
-        { testWord += 1; return true; }
+      // Always consume arrow keys so they can't leak to other panels.
+      if (ev == Event::ArrowUp)    { if (row > 0) testWord -= WORD_COLS;                             return true; }
+      if (ev == Event::ArrowDown)  { if (row < maxRow) testWord = std::min(nWords-1, testWord+WORD_COLS); return true; }
+      if (ev == Event::ArrowLeft)  { if (col > 0) testWord -= 1;                                     return true; }
+      if (ev == Event::ArrowRight) { if (col < WORD_COLS-1 && testWord+1 < nWords) testWord += 1;   return true; }
 
       // Space: mark / unmark the current word
       if (ev == Event::Character(' ')) {
@@ -539,6 +538,13 @@ int main() {
         }
         return true;
       }
+    }
+
+    // ── Output/Log panel — consume arrows so they don't reach connRadio ─────────
+    if (focus == 4) {
+      if (ev == Event::ArrowUp || ev == Event::ArrowDown ||
+          ev == Event::ArrowLeft || ev == Event::ArrowRight)
+        return true;
     }
 
     return false;
