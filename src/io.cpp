@@ -178,12 +178,13 @@ void PenBackend::connectUSB(const std::string &port) {
 
   if (reader->isOpen()) {
     // ── Key fix for wired mode ───────────────────────────────────────────────
-    // The firmware boots in WIRED mode by default, but if the user previously
-    // switched it to WIFI (via button or command), it won't stream over USB
-    // until it receives MODE:USB.  A small settle delay lets the serial driver
-    // finish initialising before we write — the ESP32 auto-resets on DTR toggle
-    // when a port is opened, so we must wait for it to boot.
-    usleep(800000); // 800 ms: covers the ~500–700 ms ESP32 boot time
+    // Opening the port toggles DTR which resets the ESP32 (~200 ms).
+    // We wait just long enough for the DTR reset to complete, then write
+    // MODE:USB into the UART buffer.  The firmware reads it from the buffer
+    // when loop() starts (~1.5–2 s later) and confirms WIRED mode.
+    // Apps don't need to wait further — getLatestData() returns false until
+    // the ESP32 finishes calibration and starts streaming, then data flows.
+    usleep(250000); // 250 ms: DTR reset settle (not a full boot wait)
     reader->sendCommand("MODE:USB\n");
     currentMode   = ConnectionMode::USB;
     currentStatus = "Connected via USB (" + port + ")";
