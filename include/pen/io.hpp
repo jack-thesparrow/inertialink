@@ -5,7 +5,7 @@
 namespace pen {
 
 // Connection mode — use this in the UI to drive PenBackend::connect*().
-enum class ConnectionMode { None, USB, Bluetooth, WiFi };
+enum class ConnectionMode { None, USB, WiFi };
 
 // Default port/address values and physics constants.
 // All app-layer code references these — nothing is hardcoded in the apps.
@@ -13,8 +13,7 @@ enum class ConnectionMode { None, USB, Bluetooth, WiFi };
 // with generate_synthetic_data.py (IDLE_TIMEOUT_MS) and the ESP32 firmware.
 struct Defaults {
   // Connection
-  static constexpr const char *usbPort       = "/dev/ttyUSB0";
-  static constexpr const char *bluetoothPort = "/dev/rfcomm0";
+  static constexpr const char *usbPort = "/dev/ttyUSB0";
   // Decoder and visualizer listen on separate ports so both can run
   // simultaneously — SO_REUSEPORT load-balances (one receiver per packet),
   // two ports guarantee each process sees every packet independently.
@@ -34,8 +33,8 @@ struct Defaults {
 
 struct IMUData {
   float pitch = 0.0f;
-  float roll = 0.0f;
-  float yaw = 0.0f;
+  float roll  = 0.0f;
+  float yaw   = 0.0f;
   float accel_z = 0.0f;
 };
 
@@ -61,32 +60,36 @@ public:
   virtual bool readData(IMUData &data) = 0;
 };
 
-// --- WIRED & BLUETOOTH READER ---
+// --- WIRED (USB) SERIAL READER ---
+// Also used for the socat simulation virtual tty.
+// sendCommand() writes a raw string to the serial port so the firmware
+// can be poked into the correct mode at connect-time.
 class SerialReader : public IMUReader {
 public:
-  SerialReader(const std::string &portName);
+  explicit SerialReader(const std::string &portName);
   ~SerialReader() override;
 
   bool isOpen() const override;
   bool readData(IMUData &data) override;
+  void sendCommand(const std::string &cmd);
 
 private:
-  int fd;
+  int  fd;
   char buffer[256];
-  int bufPos;
+  int  bufPos;
 };
 
 // --- WI-FI UDP READER ---
 class UDPReader : public IMUReader {
 public:
-  UDPReader(int port);
+  explicit UDPReader(int port);
   ~UDPReader() override;
 
   bool isOpen() const override;
   bool readData(IMUData &data) override;
 
 private:
-  int sockfd;
+  int  sockfd;
   bool active;
 };
 
@@ -99,8 +102,9 @@ public:
   std::string getStatus() const;
   ConnectionMode getMode() const { return currentMode; }
 
+  // connectUSB: opens the port and immediately sends "MODE:USB\n" so the
+  // firmware starts streaming regardless of its current state.
   void connectUSB(const std::string &port = Defaults::usbPort);
-  void connectBluetooth(const std::string &port = Defaults::bluetoothPort);
   void connectWiFi(int listenPort = Defaults::wifiPort);
   void disconnect();
 
@@ -108,9 +112,9 @@ public:
 
 private:
   std::unique_ptr<IMUReader> activeReader;
-  IMUFilter filter;
-  ConnectionMode currentMode = ConnectionMode::None;
-  std::string currentStatus  = "Disconnected";
+  IMUFilter      filter;
+  ConnectionMode currentMode  = ConnectionMode::None;
+  std::string    currentStatus = "Disconnected";
 };
 
 } // namespace pen

@@ -65,8 +65,8 @@ int main(int argc, char *argv[]) {
   pen::PenBackend backend;
   if (mode == "usb")
     backend.connectUSB(pen::Defaults::usbPort);
-  else if (mode == "bt")
-    backend.connectBluetooth(pen::Defaults::bluetoothPort);
+  else if (mode == "sim")
+    backend.connectUSB("/tmp/vtty_laptop");
   else
     backend.connectWiFi(pen::Defaults::wifiPort);
 
