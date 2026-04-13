@@ -83,12 +83,12 @@ IMUData IMUFilter::process(const IMUData &raw) {
   }
 
   IMUData filtered;
-  filtered.pitch = (alpha * raw.pitch) + ((1.0f - alpha) * previous.pitch);
-  filtered.roll  = (alpha * raw.roll)  + ((1.0f - alpha) * previous.roll);
-  filtered.yaw   = (alpha * raw.yaw)   + ((1.0f - alpha) * previous.yaw);
-
-  // Never filter the accelerometer — we need the raw impact spikes for ML.
-  filtered.accel_z = raw.accel_z;
+  filtered.ax = (alpha * raw.ax) + ((1.0f - alpha) * previous.ax);
+  filtered.ay = (alpha * raw.ay) + ((1.0f - alpha) * previous.ay);
+  filtered.az = (alpha * raw.az) + ((1.0f - alpha) * previous.az);
+  filtered.gx = (alpha * raw.gx) + ((1.0f - alpha) * previous.gx);
+  filtered.gy = (alpha * raw.gy) + ((1.0f - alpha) * previous.gy);
+  filtered.gz = (alpha * raw.gz) + ((1.0f - alpha) * previous.gz);
 
   previous = filtered;
   return filtered;
@@ -142,13 +142,11 @@ bool SerialReader::readData(IMUData &data) {
   while (read(fd, &c, 1) > 0) {
     if (c == '\n') {
       buffer[bufPos] = '\0';
-      // Accept 3 values (pitch,roll,yaw) or 4 (with accel_z).
-      float p, r, y, az = 0.0f;
-      if (sscanf(buffer, "%f,%f,%f,%f", &p, &r, &y, &az) >= 3) {
-        data.pitch   = p * DEG_TO_RAD;
-        data.roll    = r * DEG_TO_RAD;
-        data.yaw     = y * DEG_TO_RAD;
-        data.accel_z = az;
+      float ax, ay, az, gx, gy, gz;
+      if (sscanf(buffer, "%f,%f,%f,%f,%f,%f",
+                 &ax, &ay, &az, &gx, &gy, &gz) == 6) {
+        data.ax = ax; data.ay = ay; data.az = az;
+        data.gx = gx; data.gy = gy; data.gz = gz;
         newDataReady = true;
       }
       bufPos = 0;
@@ -203,12 +201,11 @@ bool UDPReader::readData(IMUData &data) {
   int n = recvfrom(sockfd, buf, 1024, MSG_DONTWAIT, nullptr, nullptr);
   if (n > 0) {
     buf[n] = '\0';
-    float p, r, y, az = 0.0f;
-    if (sscanf(buf, "%f,%f,%f,%f", &p, &r, &y, &az) >= 3) {
-      data.pitch   = p * DEG_TO_RAD;
-      data.roll    = r * DEG_TO_RAD;
-      data.yaw     = y * DEG_TO_RAD;
-      data.accel_z = az;
+    float ax, ay, az, gx, gy, gz;
+    if (sscanf(buf, "%f,%f,%f,%f,%f,%f",
+               &ax, &ay, &az, &gx, &gy, &gz) == 6) {
+      data.ax = ax; data.ay = ay; data.az = az;
+      data.gx = gx; data.gy = gy; data.gz = gz;
       return true;
     }
   }

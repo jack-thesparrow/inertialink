@@ -69,7 +69,8 @@ static MPU6050 mpu(Wire);
 static WiFiUDP udp;
 
 // Live IMU values (globals so drawDisplay can read them without passing args)
-static float pitch = 0.0f, roll = 0.0f, yaw = 0.0f, accelZ = 0.0f;
+static float imu_ax = 0.0f, imu_ay = 0.0f, imu_az = 0.0f;
+static float imu_gx = 0.0f, imu_gy = 0.0f, imu_gz = 0.0f;
 
 // ── OLED helpers ──────────────────────────────────────────────────────────────
 static const char *modeName(Mode m) {
@@ -129,9 +130,9 @@ static void drawDisplay() {
     display.setCursor(0, 1);
     display.print(row0);
 
-    // Row 1 — pitch & roll: most frequently glanced values
+    // Row 1 — accel X & Y: most frequently glanced values
     char row1[22];
-    snprintf(row1, sizeof(row1), "P:%+5.1f    R:%+5.1f", pitch, roll);
+    snprintf(row1, sizeof(row1), "AX:%+5.2f AY:%+5.2f", imu_ax, imu_ay);
     display.setCursor(0, 9);
     display.print(row1);
   }
@@ -149,15 +150,13 @@ static void drawDisplay() {
     return;
   }
 
-  // ── Inverted yaw box ────────────────────────────────────────────────────────
-  // A white-filled strip in the blue zone appears as a bright cyan/blue band
-  // on the physical display.  Black text on it creates strong contrast.
+  // ── Inverted gyro box ────────────────────────────────────────────────────────
   display.fillRect(0, 17, SCREEN_W, 12, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
-  char yawBuf[22];
-  snprintf(yawBuf, sizeof(yawBuf), "  Yaw : %+7.2f deg", yaw);
+  char gyroBuf[22];
+  snprintf(gyroBuf, sizeof(gyroBuf), "GZ:%+7.1f d/s", imu_gz);
   display.setCursor(0, 20);
-  display.print(yawBuf);
+  display.print(gyroBuf);
 
   // Return to normal white text for the rest of the blue zone
   display.setTextColor(SSD1306_WHITE);
@@ -350,20 +349,23 @@ void loop() {
 
   if (currentMode != IDLE) {
     mpu.update();
-    pitch  = mpu.getAngleX();
-    roll   = mpu.getAngleY();
-    yaw    = mpu.getAngleZ();
-    accelZ = mpu.getAccZ();   // raw Z acceleration in g
-                               // at rest ≈ 1.0 g (gravity); spikes on impact
 
-    // 4-field CSV — accel_z is the 4th field that ALL desktop apps depend on:
-    //   viz.cpp:326    abs(az) >= 0.05  → pen-contact, draws the 2-D trail
-    //   viz.cpp:249    |az–prev| > 0.5  → stroke start, resets cube anchor
-    //   data_collector |az–prev| > 0.5  → wake-on-impact
-    //   decoder        |az–prev| > 0.5  → wake-on-impact
-    char payload[40];
+    // 6-field raw sensor data: ax,ay,az (g-force), gx,gy,gz (deg/s)
+    // Desktop apps (data_collector, decoder, visualizer) all parse 6 floats.
+    float ax = mpu.getAccX();
+    float ay = mpu.getAccY();
+    float az = mpu.getAccZ();
+    float gx = mpu.getGyroX();
+    float gy = mpu.getGyroY();
+    float gz = mpu.getGyroZ();
+
+    // Update globals for OLED display
+    imu_ax = ax; imu_ay = ay; imu_az = az;
+    imu_gx = gx; imu_gy = gy; imu_gz = gz;
+
+    char payload[80];
     snprintf(payload, sizeof(payload),
-             "%.2f,%.2f,%.2f,%.2f\n", pitch, roll, yaw, accelZ);
+             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", ax, ay, az, gx, gy, gz);
 
     if (currentMode == WIRED) {
       Serial.print(payload);

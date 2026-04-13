@@ -34,10 +34,14 @@ struct Defaults {
 };
 
 struct IMUData {
-  float pitch = 0.0f;
-  float roll  = 0.0f;
-  float yaw   = 0.0f;
-  float accel_z = 0.0f;
+  // Accelerometer (g-force)
+  float ax = 0.0f;
+  float ay = 0.0f;
+  float az = 0.0f;
+  // Gyroscope (deg/s)
+  float gx = 0.0f;
+  float gy = 0.0f;
+  float gz = 0.0f;
 };
 
 // --- SIGNAL PROCESSING: LOW-PASS FILTER ---

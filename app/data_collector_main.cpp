@@ -9,12 +9,11 @@
 
 namespace fs = std::filesystem;
 
-// ML Input Tensor Format
+// ML Input Tensor Format — 6-DOF raw sensor data
 struct DataPoint {
   long long timestamp;
-  float x;       // Lever-Arm Projected X
-  float y;       // Lever-Arm Projected Y
-  float accel_z; // Raw Z-Axis Impact
+  float ax, ay, az;   // Accelerometer (g-force)
+  float gx, gy, gz;   // Gyroscope (deg/s)
 };
 
 // ---------------------------------------------------------
@@ -37,10 +36,11 @@ void saveStrokeToCSV(const std::string &baseDir,
   }
 
   std::ofstream outFile(filename);
-  outFile << "time_ms,x,y,accel_z\n";
+  outFile << "time_ms,ax,ay,az,gx,gy,gz\n";
   for (const auto &pt : buffer) {
-    outFile << pt.timestamp << "," << pt.x << "," << pt.y << "," << pt.accel_z
-            << "\n";
+    outFile << pt.timestamp << ","
+            << pt.ax << "," << pt.ay << "," << pt.az << ","
+            << pt.gx << "," << pt.gy << "," << pt.gz << "\n";
   }
   outFile.close();
   std::cout << "[SAVED] Captured " << buffer.size() << " data points to "
@@ -78,7 +78,6 @@ int main(int argc, char *argv[]) {
 
   // Physics constants live in pen::Defaults (io.hpp) so they stay in sync
   // with decoder_main.cpp and the synthetic data generator.
-  constexpr float LEVER_ARM_MM      = pen::Defaults::leverArmMm;
   constexpr float WAKE_THRESHOLD_Z  = pen::Defaults::wakeThresholdZ;
   constexpr float ACTIVITY_THRESHOLD= pen::Defaults::activityThreshold;
   constexpr int   IDLE_TIMEOUT_MS   = pen::Defaults::idleTimeoutMs;
@@ -87,28 +86,26 @@ int main(int argc, char *argv[]) {
   std::vector<DataPoint> strokeBuffer;
   strokeBuffer.reserve(5000);
 
-  pen::IMUData currentData, prevData, anchor;
+  pen::IMUData currentData, prevData;
 
   while (true) {
     std::cout << "\n[IDLE] Waiting for pen impact on paper...\n";
 
-    // 1. WAKE-ON-IMPACT LOOP
+    // 1. WAKE-ON-IMPACT LOOP — az spike triggers recording
     bool isWriting = false;
     while (!isWriting) {
       if (backend.getLatestData(currentData)) {
-        // Calculate the Z-axis shockwave
-        float z_shock = std::abs(currentData.accel_z - prevData.accel_z);
+        float z_shock = std::abs(currentData.az - prevData.az);
 
         if (z_shock > WAKE_THRESHOLD_Z) {
           std::cout << "[RECORDING] Impact detected! Writing...\n";
-          anchor = currentData; // Tare the grip angle instantly upon impact
           isWriting = true;
         }
         prevData = currentData;
       }
     }
 
-    // 2. CONTINUOUS WRITING LOOP
+    // 2. CONTINUOUS WRITING LOOP — record raw 6-DOF sensor data
     strokeBuffer.clear();
     auto startTime = std::chrono::steady_clock::now();
     long long lastActiveTime = 0;
@@ -121,24 +118,22 @@ int main(int argc, char *argv[]) {
                              now - startTime)
                              .count();
 
-        // Calculate deltas to see if the pen is currently moving
-        float dPitch = std::abs(currentData.pitch - prevData.pitch);
-        float dYaw = std::abs(currentData.yaw - prevData.yaw);
-        float z_shock = std::abs(currentData.accel_z - prevData.accel_z);
+        // Calculate activity from gyroscope angular velocity magnitude
+        float gyroMag = std::sqrt(currentData.gx * currentData.gx +
+                                  currentData.gy * currentData.gy +
+                                  currentData.gz * currentData.gz);
+        float z_shock = std::abs(currentData.az - prevData.az);
 
-        // If moving or tapping, reset the sleep timer
-        if (dPitch > ACTIVITY_THRESHOLD || dYaw > ACTIVITY_THRESHOLD ||
+        // If the pen is moving (gyro activity) or tapping, reset the sleep timer
+        if (gyroMag > (ACTIVITY_THRESHOLD * 180.0f / M_PI) ||
             z_shock > WAKE_THRESHOLD_Z) {
           lastActiveTime = elapsedMs;
         }
 
-        // Project the relative angles into 2D canvas coordinates
-        float relYaw = currentData.yaw - anchor.yaw;
-        float relPitch = currentData.pitch - anchor.pitch;
-        float x_mm = -relYaw * LEVER_ARM_MM;
-        float y_mm = relPitch * LEVER_ARM_MM;
-
-        strokeBuffer.push_back({elapsedMs, x_mm, y_mm, currentData.accel_z});
+        // Record raw sensor values — the ML model learns from these directly
+        strokeBuffer.push_back({elapsedMs,
+                                currentData.ax, currentData.ay, currentData.az,
+                                currentData.gx, currentData.gy, currentData.gz});
 
         // 3. IDLE TIMEOUT LOGIC
         if ((elapsedMs - lastActiveTime) > IDLE_TIMEOUT_MS) {

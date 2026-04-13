@@ -33,7 +33,11 @@ private:
   // Stroke detection state
   IMUData  prevIMU;
   bool     prevIMUValid{false};
-  IMUData  cubeAnchor;           // IMU angles at stroke start; cube rotates relative to this
+
+  // Integrated gyro orientation (radians) — used for cube rotation and 2D canvas
+  float intPitch{0.0f}, intRoll{0.0f}, intYaw{0.0f};
+  // Anchor values at stroke start — cube rotates relative to these
+  float anchorPitch{0.0f}, anchorRoll{0.0f}, anchorYaw{0.0f};
 
   // HUD state (polled from /tmp/inertialink_word and /tmp/inertialink_mode)
   int         frameCount{0};

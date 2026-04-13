@@ -241,21 +241,31 @@ void Visualizer::drawCube(const IMUData &imu) {
   }
 
   // ── New-stroke detection ──────────────────────────────────────────────────
-  // An accel_z spike (same threshold as data_collector and decoder) signals
+  // An az spike (same threshold as data_collector and decoder) signals
   // pen-on-paper impact.  On detection: clear the canvas trail and reset the
-  // cube anchor so the cube shows rotation *relative to the grip at stroke
-  // start* rather than the absolute IMU orientation.
+  // integrated orientation anchor so the cube shows rotation *relative to the
+  // grip at stroke start* rather than the absolute accumulated orientation.
   if (prevIMUValid) {
-    float z_shock = std::abs(imu.accel_z - prevIMU.accel_z);
+    float z_shock = std::abs(imu.az - prevIMU.az);
     if (z_shock > pen::Defaults::wakeThresholdZ) {
-      strokeTrail.clear();   // strokeAnchor resets on next point (see below)
-      cubeAnchor = imu;      // cube neutral = current grip angle
+      strokeTrail.clear();
+      // Reset the integrated orientation anchor
+      intPitch = 0.0f; intRoll = 0.0f; intYaw = 0.0f;
+      anchorPitch = 0.0f; anchorRoll = 0.0f; anchorYaw = 0.0f;
     }
   } else {
-    cubeAnchor = imu;        // first frame: treat as anchor immediately
+    intPitch = 0.0f; intRoll = 0.0f; intYaw = 0.0f;
+    anchorPitch = 0.0f; anchorRoll = 0.0f; anchorYaw = 0.0f;
   }
   prevIMU      = imu;
   prevIMUValid = true;
+
+  // Integrate gyroscope (deg/s) → accumulated orientation (radians)
+  constexpr float DT = 0.01f;  // 100 Hz
+  constexpr float DEG2RAD = static_cast<float>(M_PI / 180.0);
+  intPitch += imu.gx * DT * DEG2RAD;
+  intRoll  += imu.gy * DT * DEG2RAD;
+  intYaw   += imu.gz * DT * DEG2RAD;
 
   int width, height;
   glfwGetFramebufferSize(window, &width, &height);
@@ -277,9 +287,9 @@ void Visualizer::drawCube(const IMUData &imu) {
 
   // Rotate by delta from the anchor set at stroke start, so the cube sits at
   // neutral when the pen first touches paper and shows only the writing motion.
-  float dYaw   = imu.yaw   - cubeAnchor.yaw;
-  float dPitch = imu.pitch - cubeAnchor.pitch;
-  float dRoll  = imu.roll  - cubeAnchor.roll;
+  float dYaw   = intYaw   - anchorYaw;
+  float dPitch = intPitch - anchorPitch;
+  float dRoll  = intRoll  - anchorRoll;
 
   glm::mat4 cubeModel = glm::mat4(1.0f);
   cubeModel = glm::rotate(cubeModel, dYaw,   glm::vec3(0.0f, 1.0f, 0.0f));
@@ -304,28 +314,22 @@ void Visualizer::drawCube(const IMUData &imu) {
   // ==========================================
   glViewport(halfWidth, 0, halfWidth, height);
 
-  // Lever-arm projection — identical physics to data_collector and decoder.
-  //   x_mm = -yaw_rad  * leverArmMm
+  // Lever-arm projection using integrated gyro orientation — identical
+  // physics to data_collector and decoder.
+  //   x_mm = -yaw_rad   * leverArmMm
   //   y_mm =  pitch_rad * leverArmMm
-  // Scale: 200 mm of pen travel = 1.0 GL unit; with ortho ±1.5 that gives
-  // ±300 mm of visible range — enough for the widest trained words.
   constexpr float MM_TO_GL = 1.0f / 200.0f;
   glm::vec3 pt(
-      -imu.yaw   * pen::Defaults::leverArmMm * MM_TO_GL,
-       imu.pitch * pen::Defaults::leverArmMm * MM_TO_GL,
+      -intYaw   * pen::Defaults::leverArmMm * MM_TO_GL,
+       intPitch * pen::Defaults::leverArmMm * MM_TO_GL,
       0.0f);
 
   // Only accumulate trail while the pen is on paper.
-  // Synthetic CSVs set accel_z = 0.0 during inter-character hovers and the
-  // idle tail; the real IMU also reads near-zero when the pen is in the air.
-  // Skipping those frames prevents the "return-to-origin" artefact where the
-  // trail draws a straight line back to centre after the pen is lifted.
-  // Minimum writing pressure in synthetic data is ~0.09, so 0.05 is a safe
-  // threshold that accepts any real contact while rejecting idle frames.
+  // The az channel reads ~1.0 g at rest (gravity) and spikes on impact.
+  // When the pen is in the air, az magnitude drops near zero in synthetic
+  // data; for real hardware, use a threshold around the gravity baseline.
   constexpr float PEN_CONTACT_MIN = 0.05f;
-  if (std::abs(imu.accel_z) >= PEN_CONTACT_MIN) {
-    // First point after a clear becomes the anchor; every subsequent point is
-    // stored relative to it so the stroke always starts at the canvas centre.
+  if (std::abs(imu.az) >= PEN_CONTACT_MIN) {
     if (strokeTrail.empty()) {
       strokeAnchor = pt;
       strokeTrail.push_back(glm::vec3(0.0f));

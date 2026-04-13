@@ -1,35 +1,23 @@
 """
-generate_synthetic_data.py  —  High-quality synthetic stroke generator
-=======================================================================
+generate_synthetic_data.py  —  High-quality synthetic stroke generator (6-DOF)
+================================================================================
+Generates training data in the 6-channel raw sensor format:
+    time_ms, ax, ay, az, gx, gy, gz
+
+Each channel simulates the physical signature of writing:
+  - ax, ay: lateral accelerations from pen movement (proportional to character
+    shape oscillation velocity changes)
+  - az: vertical acceleration including gravity (~1.0g at rest, spikes on impact,
+    drops near zero when pen lifts)
+  - gx, gy, gz: angular velocities from wrist rotation during writing
+    (proportional to character shape — sharper turns = higher angular velocity)
+
 Design goals
 ------------
-1. Every character has a UNIQUE, physically-motivated signature so that words
-   with shared letters are still distinguishable (unlike the old ord()/20 hack
-   that crammed all lowercase into 4.8-6.0 Hz).
-
-2. Oscillation uses LOCAL phase (fraction of the character's own duration)
-   so the waveform is the same shape regardless of where in the word the
-   character appears.
-
-3. Y-center bands are well-separated by category:
-       numbers   : y_center ≈ -15 mm   (drops far below baseline)
-       descenders: y_center ≈  -5 mm   (g, j, p, q, y)
-       baseline  : y_center ≈   2 mm   (a, c, e, i, m, n, o, r, s, u, v, w, x, z)
-       ascenders : y_center ≈  12 mm   (b, d, f, h, k, l, t)
-       capitals  : y_center ≈  18 mm
-
-4. Augmentation applied per-sample:
-       • Horizontal drift   (global x-axis shift)
-       • Vertical offset    (global y-axis shift)
-       • Per-frame Gaussian position noise (σ=0.5 mm)
-       • Per-frame Gaussian accel_z noise  (σ=0.03)
-       • Speed jitter       (duration ± 30 % per character)
-       • Pressure jitter    (accel_z scale ± 20 %)
-
-5. 200 samples per word, 12 words → 2 400 total CSVs.
-
-Output format (same as before, directly consumable by train_bilstm.py):
-    time_ms, x, y, accel_z
+1. Every character has a UNIQUE, physically-motivated 6-DOF signature.
+2. Oscillation uses LOCAL phase (fraction of the character's own duration).
+3. Augmentation: drift, noise, speed/pressure jitter applied per-sample.
+4. 200 samples per word, 12 words → 2400 total CSVs.
 """
 
 import math
@@ -57,18 +45,13 @@ WORDS = [
     "open",
 ]
 
-SAMPLES_PER_WORD = 200   # 200 × 12 words = 2 400 samples
+SAMPLES_PER_WORD = 200   # 200 × 12 words = 2400 samples
 SAMPLE_RATE_MS   = 10    # 100 Hz, 10 ms per frame
+DT               = SAMPLE_RATE_MS / 1000.0  # seconds per frame
 
 # ---------------------------------------------------------------------------
 # PER-CHARACTER PROFILES
 # (n_cycles, y_center_mm, y_amp_mm, x_width_mult, base_duration_frames)
-#
-# n_cycles      – how many full oscillation cycles across the character
-# y_center_mm   – vertical resting position of this glyph
-# y_amp_mm      – half-amplitude of the oscillation
-# x_width_mult  – width relative to the default 2 mm/frame advance
-# base_duration – number of 10 ms frames at normal speed
 # ---------------------------------------------------------------------------
 CHAR_PROFILE = {
     # --- LOWERCASE baseline glyphs (small, round) ---
@@ -131,9 +114,8 @@ CHAR_PROFILE = {
     'X': (2.0, 17.0,  9.5, 1.1, 22),
 }
 
-# Fallback for any character not explicitly listed
+
 def _default_profile(char):
-    """Reasonable defaults for characters not in the table."""
     if char.isupper():
         return (1.5, 16.0, 8.0, 1.0, 22)
     if char.isdigit():
@@ -142,94 +124,127 @@ def _default_profile(char):
 
 
 def get_profile(char):
-    if char in CHAR_PROFILE:
-        return CHAR_PROFILE[char]
-    return _default_profile(char)
+    return CHAR_PROFILE.get(char, _default_profile(char))
 
 
 # ---------------------------------------------------------------------------
-# STROKE GENERATOR
+# STROKE GENERATOR — 6-DOF VERSION
 # ---------------------------------------------------------------------------
 
 def generate_word_data(word: str) -> pd.DataFrame:
     """
-    Generate one synthetic stroke CSV for *word* with random augmentation.
-    Returns a DataFrame with columns [time_ms, x, y, accel_z].
+    Generate one synthetic 6-DOF stroke CSV for *word* with random augmentation.
+    Returns a DataFrame with columns [time_ms, ax, ay, az, gx, gy, gz].
+
+    Physics model:
+    - We generate an idealized pen-tip position trajectory (x_mm, y_mm) using
+      the same character profiles as before.
+    - Accelerations (ax, ay) are derived from the 2nd derivative of position.
+    - az simulates gravity + pen-paper contact pressure.
+    - Gyroscope values (gx, gy, gz) are derived from angular velocity of the
+      pen (wrist rotation), proportional to the rate of change of the stroke
+      direction. The pen pivots around the wrist, so lateral movement creates
+      angular velocity.
     """
-    rng = random.Random()          # fresh RNG per call (uses global seed)
+    rng = random.Random()
 
-    # --- Global augmentation parameters (vary per sample) ---
-    x_drift      = rng.uniform(-5.0,  5.0)    # mm shift across whole stroke
-    y_offset     = rng.uniform(-2.0,  2.0)    # mm shift across whole stroke
-    speed_scale  = rng.uniform(0.7,  1.3)     # global speed multiplier
-    pressure_scale = rng.uniform(0.8, 1.2)    # accel_z scale
+    # Global augmentation
+    speed_scale    = rng.uniform(0.7, 1.3)
+    pressure_scale = rng.uniform(0.8, 1.2)
+    gyro_scale     = rng.uniform(0.7, 1.3)
 
-    data     = []
-    time_ms  = 0
-    x        = 0.0
-    y        = 0.0
+    # First: generate the position trajectory
+    positions = []  # list of (x_mm, y_mm) tuples
+    x, y = 0.0, 0.0
 
-    # ---- 1. WAKE IMPACT ----
-    data.append([time_ms, x + x_drift, y + y_offset, 0.0])
-    time_ms += SAMPLE_RATE_MS
-    data.append([time_ms, x + x_drift, y + y_offset, 2.5])   # Z shockwave
-
-    # ---- 2. WRITE EACH CHARACTER ----
     for char in word:
         n_cycles, y_center, y_amp, x_width_mult, base_dur = get_profile(char)
-
-        # Speed jitter per character
         duration = max(8, int(base_dur * speed_scale * rng.uniform(0.85, 1.15)))
-
-        # Pressure for this character (ballpoint scraping)
-        base_pressure = rng.uniform(0.12, 0.35) * pressure_scale
-
-        x_advance = 2.0 * x_width_mult   # mm per frame
+        x_advance = 2.0 * x_width_mult
 
         for step in range(duration):
-            time_ms += SAMPLE_RATE_MS
-
-            # Local phase [0, 2π * n_cycles] — shape is always the same
             phase = (step / duration) * 2.0 * math.pi * n_cycles
-
-            # X: steady rightward advance + small lateral wobble
             x += x_advance + rng.gauss(0.0, 0.3)
+            y_raw = y_center + y_amp * math.sin(phase)
+            y = y_raw + rng.gauss(0.0, 0.5)
+            positions.append((x, y))
 
-            # Y: oscillation around y_center with Gaussian noise
-            y_raw  = y_center + y_amp * math.sin(phase)
-            y_noise = rng.gauss(0.0, 0.5)
-            y       = y_raw + y_noise
+        # Hover between characters
+        positions.append((x, y))
 
-            # accel_z: pressure with noise
-            accel_z = abs(rng.gauss(base_pressure, 0.03))
-
-            data.append([
-                time_ms,
-                x + x_drift,
-                y + y_offset,
-                accel_z,
-            ])
-
-        # Brief hover between characters (pen lifts slightly)
-        time_ms += SAMPLE_RATE_MS
-        data.append([time_ms, x + x_drift, y + y_offset, 0.0])
-
-    # ---- 3. IDLE TAIL ----
-    # Must be >= IDLE_TIMEOUT_MS / SAMPLE_RATE_MS = 200 frames.
-    # We use 210 for a small margin of safety.
-    final_x = x + x_drift
-    final_y = y + y_offset
+    # Add idle tail
     for _ in range(210):
-        time_ms += SAMPLE_RATE_MS
-        # Add tiny noise so the model doesn't learn a perfectly flat line
-        data.append([
-            time_ms,
-            final_x + rng.gauss(0.0, 0.05),
-            final_y + rng.gauss(0.0, 0.05),
-            0.0,
-        ])
+        positions.append((x + rng.gauss(0.0, 0.05), y + rng.gauss(0.0, 0.05)))
 
-    return pd.DataFrame(data, columns=["time_ms", "x", "y", "accel_z"])
+    # Now derive 6-DOF sensor data from the trajectory
+    data = []
+    time_ms = 0
+
+    # Compute velocities and accelerations via finite differences
+    n_frames = len(positions)
+    vx = [0.0] * n_frames
+    vy = [0.0] * n_frames
+    acc_x = [0.0] * n_frames
+    acc_y = [0.0] * n_frames
+
+    for i in range(1, n_frames):
+        vx[i] = (positions[i][0] - positions[i-1][0]) / DT  # mm/s
+        vy[i] = (positions[i][1] - positions[i-1][1]) / DT
+
+    for i in range(1, n_frames):
+        acc_x[i] = (vx[i] - vx[max(0, i-1)]) / DT  # mm/s²
+        acc_y[i] = (vy[i] - vy[max(0, i-1)]) / DT
+
+    # Determine which frames are "writing" (before idle tail starts)
+    num_writing_frames = n_frames - 210  # approximate
+
+    for i in range(n_frames):
+        time_ms = i * SAMPLE_RATE_MS
+
+        # Accelerometer (in g-force, 1g = 9810 mm/s²)
+        # Scale pen accelerations to g-force range typical of MPU6050
+        ax = acc_x[i] / 9810.0 + rng.gauss(0.0, 0.02)
+        ay = acc_y[i] / 9810.0 + rng.gauss(0.0, 0.02)
+
+        # az: gravity baseline + contact pressure during writing
+        if i < num_writing_frames:
+            base_pressure = rng.uniform(0.08, 0.25) * pressure_scale
+            # Check if this is a hover frame (between characters)
+            is_hover = False
+            frame_in_word = i
+            char_start = 0
+            for char in word:
+                _, _, _, _, base_dur = get_profile(char)
+                dur = max(8, int(base_dur * speed_scale * rng.uniform(0.85, 1.15)))
+                char_start += dur
+                if i == char_start:
+                    is_hover = True
+                    break
+
+            if is_hover:
+                az = rng.gauss(0.0, 0.01)  # pen lifted
+            else:
+                az = 1.0 + base_pressure + rng.gauss(0.0, 0.03)
+        else:
+            az = rng.gauss(0.0, 0.01)  # idle: pen lifted
+
+        # Wake impact
+        if i == 0:
+            ax, ay, az = 0.0, 0.0, 0.0
+        elif i == 1:
+            az = 2.5  # Z shockwave from pen hitting paper
+
+        # Gyroscope (deg/s) — angular velocity from wrist rotation
+        # The pen acts as a lever arm; lateral velocity produces angular velocity
+        # ω ≈ v_linear / lever_arm_mm (in rad/s), then convert to deg/s
+        lever_arm = 150.0  # mm, matches pen::Defaults::leverArmMm
+        gx = (vy[i] / lever_arm) * (180.0 / math.pi) * gyro_scale + rng.gauss(0.0, 2.0)
+        gy = (-vx[i] / lever_arm) * (180.0 / math.pi) * gyro_scale + rng.gauss(0.0, 2.0)
+        gz = rng.gauss(0.0, 1.0)  # small yaw-axis rotation noise
+
+        data.append([time_ms, ax, ay, az, gx, gy, gz])
+
+    return pd.DataFrame(data, columns=["time_ms", "ax", "ay", "az", "gx", "gy", "gz"])
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +252,7 @@ def generate_word_data(word: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def main():
-    print("=== Smart Pen High-Quality Synthetic Data Generator ===")
+    print("=== Smart Pen 6-DOF Synthetic Data Generator ===")
     print(f"Words: {WORDS}")
     print(f"Samples per word: {SAMPLES_PER_WORD}")
     print(f"Total CSVs: {len(WORDS) * SAMPLES_PER_WORD}\n")
