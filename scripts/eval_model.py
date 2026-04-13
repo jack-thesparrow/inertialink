@@ -105,7 +105,7 @@ def main() -> None:
             sample_num = os.path.splitext(os.path.basename(csv_path))[0].replace("sample_", "")
 
             df      = pd.read_csv(csv_path)
-            x       = df[["x", "y", "accel_z"]].values.astype(np.float32)[np.newaxis]  # (1,T,3)
+            x       = df[["ax", "ay", "az", "gx", "gy", "gz"]].values.astype(np.float32)[np.newaxis]  # (1,T,6)
             logits  = sess.run(None, {input_name: x})[0][0]                              # (T,C)
 
             predicted, conf, per_char = ctc_greedy_decode(logits)

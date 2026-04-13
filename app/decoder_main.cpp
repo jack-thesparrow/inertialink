@@ -17,11 +17,12 @@ static void writeMode(const char *mode) {
   }
 }
 
-// ML Input Format
+// ML Input Format — 6-DOF raw sensor data
+static constexpr int NUM_FEATURES = 6;
+
 struct DataPoint {
-  float x;
-  float y;
-  float accel_z;
+  float ax, ay, az;   // Accelerometer (g-force)
+  float gx, gy, gz;   // Gyroscope (deg/s)
 };
 
 // Must match train_bilstm.py ALPHABET exactly.
@@ -90,9 +91,6 @@ static float log_sum_exp(float a, float b) {
 // ---------------------------------------------------------
 // CTC BEAM SEARCH
 // ---------------------------------------------------------
-// A beam tracks two log-probabilities:
-//   log_pb  — probability of all paths ending in CTC blank
-//   log_pnb — probability of all paths ending in a real character
 struct Beam {
   float log_pb  = LOG_ZERO;
   float log_pnb = LOG_ZERO;
@@ -101,15 +99,12 @@ struct Beam {
 
 static constexpr int BEAM_WIDTH = 10;
 
-// Returns the decoded text.  Also fills per_char_conf with peak softmax
-// probabilities for each emitted character (for the confidence display).
 static std::string ctc_beam_search(
     const float *logits_ptr, int64_t seq_len, int64_t num_classes,
     std::vector<std::pair<char, float>> &per_char_conf)
 {
-  // beams[prefix] = Beam
   std::unordered_map<std::string, Beam> beams;
-  beams[""].log_pb = 0.0f;   // empty prefix, probability 1 (log = 0)
+  beams[""].log_pb = 0.0f;
 
   for (int64_t t = 0; t < seq_len; ++t) {
     const float *frame = logits_ptr + t * num_classes;
@@ -126,16 +121,13 @@ static std::string ctc_beam_search(
     for (auto &[prefix, bm] : beams) {
       char last = prefix.empty() ? '\0' : prefix.back();
 
-      // ── extend with blank ──
       next[prefix].log_pb =
           log_sum_exp(next[prefix].log_pb,
                       log_sum_exp(bm.log_pb, bm.log_pnb) + lp[0]);
 
-      // ── extend with each character ──
       for (int c = 1; c < static_cast<int>(num_classes); ++c) {
         char ch = ALPHABET[c];
         if (ch == last) {
-          // Duplicate: blank path emits new char; nonblank path stays
           std::string ext = prefix + ch;
           next[ext].log_pnb =
               log_sum_exp(next[ext].log_pnb, bm.log_pb + lp[c]);
@@ -150,7 +142,6 @@ static std::string ctc_beam_search(
       }
     }
 
-    // Prune to top BEAM_WIDTH by total log-probability
     if (static_cast<int>(next.size()) > BEAM_WIDTH) {
       std::vector<std::pair<float, std::string>> scores;
       scores.reserve(next.size());
@@ -166,15 +157,12 @@ static std::string ctc_beam_search(
     }
   }
 
-  // Pick best beam
   std::string best_text;
   float best_score = LOG_ZERO;
   for (auto &[p, b] : beams) {
     if (b.log_total() > best_score) { best_score = b.log_total(); best_text = p; }
   }
 
-  // Per-char confidence: for each character in the best text, find the peak
-  // softmax probability across all timesteps for that character's index.
   for (char ch : best_text) {
     auto pos = ALPHABET.find(ch);
     if (pos == std::string::npos) continue;
@@ -197,19 +185,22 @@ void runAIInference(Ort::Session &session,
   if (strokeBuffer.empty())
     return;
 
-  // 1. Flatten stroke into [1, seq_len, 3] float array
+  // 1. Flatten stroke into [1, seq_len, NUM_FEATURES] float array
   std::vector<float> input_tensor_values;
-  input_tensor_values.reserve(strokeBuffer.size() * 3);
+  input_tensor_values.reserve(strokeBuffer.size() * NUM_FEATURES);
   for (const auto &pt : strokeBuffer) {
-    input_tensor_values.push_back(pt.x);
-    input_tensor_values.push_back(pt.y);
-    input_tensor_values.push_back(pt.accel_z);
+    input_tensor_values.push_back(pt.ax);
+    input_tensor_values.push_back(pt.ay);
+    input_tensor_values.push_back(pt.az);
+    input_tensor_values.push_back(pt.gx);
+    input_tensor_values.push_back(pt.gy);
+    input_tensor_values.push_back(pt.gz);
   }
 
   Ort::MemoryInfo memory_info =
       Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
   std::vector<int64_t> input_shape = {
-      1, static_cast<int64_t>(strokeBuffer.size()), 3};
+      1, static_cast<int64_t>(strokeBuffer.size()), NUM_FEATURES};
 
   Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
       memory_info, input_tensor_values.data(), input_tensor_values.size(),
@@ -222,16 +213,11 @@ void runAIInference(Ort::Session &session,
     auto output_tensors = session.Run(Ort::RunOptions{nullptr}, input_names,
                                       &input_tensor, 1, output_names, 1);
 
-    // Shape: [1, seq_len, num_classes]
     float *logits_ptr   = output_tensors.front().GetTensorMutableData<float>();
     auto   output_shape = output_tensors.front().GetTensorTypeAndShapeInfo().GetShape();
     int64_t seq_len     = output_shape[1];
     int64_t num_classes = output_shape[2];
 
-    // CTC BEAM SEARCH DECODING
-    // Tracks BEAM_WIDTH=10 candidate prefixes simultaneously, accumulating
-    // path probabilities in log-space to avoid float underflow.
-    // Recovers characters that greedy argmax would drop (e.g. 'o' in "world").
     std::vector<std::pair<char, float>> char_confs;
     std::string predicted_text =
         ctc_beam_search(logits_ptr, seq_len, num_classes, char_confs);
@@ -273,13 +259,8 @@ void runAIInference(Ort::Session &session,
 // MAIN APPLICATION
 // ---------------------------------------------------------
 int main(int argc, char *argv[]) {
-  // Flush stdout immediately when piped (e.g. via the TUI).
-  // Without this, C++ cout uses block-buffering on non-tty fds and output
-  // only appears in the log pane when the buffer fills (~4 KB) or the
-  // process exits — making predictions invisible during a session.
   std::cout.setf(std::ios::unitbuf);
 
-  // Default to "usb" for wired ESP32 usage.
   std::string mode = (argc > 1) ? argv[1] : "usb";
 
   writeMode("idle");
@@ -288,10 +269,8 @@ int main(int argc, char *argv[]) {
   std::cout << "[System] Booting ONNX Machine Learning Engine...\n";
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "SmartPenDecoder");
   Ort::SessionOptions session_options;
-  session_options.SetIntraOpNumThreads(
-      1); // Run efficiently on a single CPU core
+  session_options.SetIntraOpNumThreads(1);
 
-  // We wrap this in a try-catch to get EXACT error messages
   std::unique_ptr<Ort::Session> session;
   try {
     session = std::make_unique<Ort::Session>(env, MODEL_PATH, session_options);
@@ -308,8 +287,6 @@ int main(int argc, char *argv[]) {
   }
 
   // --- 2. INITIALIZE HARDWARE BACKEND ---
-  // Port/address defaults live in pen::Defaults so the UI can reference them
-  // too — nothing is hardcoded here.
   pen::PenBackend backend;
   if (mode == "usb")
     backend.connectUSB(pen::Defaults::usbPort);
@@ -317,57 +294,42 @@ int main(int argc, char *argv[]) {
     backend.connectBluetooth(pen::Defaults::btPort);
   else if (mode == "sim")
     backend.connectUSB("/tmp/vtty_laptop");
-  else // "wifi" — matches mock_esp32.py
+  else // "wifi"
     backend.connectWiFi(pen::Defaults::wifiPort);
 
   // Alpha=1.0 bypasses the low-pass filter (passthrough).
-  //
-  // Why: training CSVs already contain once-filtered x/y (the data_collector
-  // applied the filter when writing them).  If we filter again here the mock
-  // would feed double-smoothed, lagged values to the model — a completely
-  // different signal from what it trained on.  With alpha=1.0 the round-trip
-  // is exact: mock reads x_csv → converts to angle → io.cpp converts back →
-  // no extra filter → x_inf == x_csv.
-  //
-  // For real ESP32 hardware (which sends raw noisy angles) you may re-enable
-  // smoothing by passing a lower alpha, e.g. backend.setSmoothing(0.2f), and
-  // re-collecting training data with the same setting.
   backend.setSmoothing(1.0f);
 
   std::cout << "Mode: " << backend.getStatus() << "\n";
   std::cout << "--------------------------------\n";
 
-  // Physics constants — shared with data_collector via pen::Defaults (io.hpp).
-  // Must match the values used when training data was collected.
-  constexpr float LEVER_ARM_MM       = pen::Defaults::leverArmMm;
   constexpr float WAKE_THRESHOLD_Z   = pen::Defaults::wakeThresholdZ;
   constexpr float ACTIVITY_THRESHOLD = pen::Defaults::activityThreshold;
   constexpr int   IDLE_TIMEOUT_MS    = pen::Defaults::idleTimeoutMs;
 
   std::vector<DataPoint> strokeBuffer;
   strokeBuffer.reserve(5000);
-  pen::IMUData currentData, prevData, anchor;
+  pen::IMUData currentData, prevData;
 
   while (true) {
     std::cout << "\n[AI IDLE] Waiting for pen impact...\n";
     writeMode("idle");
 
-    // 1. WAKE-ON-IMPACT LOOP
+    // 1. WAKE-ON-IMPACT LOOP — az spike triggers recording
     bool isWriting = false;
     while (!isWriting) {
       if (backend.getLatestData(currentData)) {
-        if (std::abs(currentData.accel_z - prevData.accel_z) >
+        if (std::abs(currentData.az - prevData.az) >
             WAKE_THRESHOLD_Z) {
           std::cout << "[AI ACTIVE] Impact detected. Reading stroke...\n";
           writeMode("Reading stroke...");
-          anchor = currentData;
           isWriting = true;
         }
         prevData = currentData;
       }
     }
 
-    // 2. CONTINUOUS WRITING LOOP
+    // 2. CONTINUOUS WRITING LOOP — record raw 6-DOF sensor data
     strokeBuffer.clear();
     auto startTime = std::chrono::steady_clock::now();
     long long lastActiveTime = 0;
@@ -379,18 +341,20 @@ int main(int argc, char *argv[]) {
                              now - startTime)
                              .count();
 
-        float dPitch = std::abs(currentData.pitch - prevData.pitch);
-        float dYaw = std::abs(currentData.yaw - prevData.yaw);
-        float z_shock = std::abs(currentData.accel_z - prevData.accel_z);
+        // Activity from gyro magnitude + az shock
+        float gyroMag = std::sqrt(currentData.gx * currentData.gx +
+                                  currentData.gy * currentData.gy +
+                                  currentData.gz * currentData.gz);
+        float z_shock = std::abs(currentData.az - prevData.az);
 
-        if (dPitch > ACTIVITY_THRESHOLD || dYaw > ACTIVITY_THRESHOLD ||
+        if (gyroMag > (ACTIVITY_THRESHOLD * 180.0f / M_PI) ||
             z_shock > WAKE_THRESHOLD_Z) {
           lastActiveTime = elapsedMs;
         }
 
-        float x_mm = -(currentData.yaw - anchor.yaw) * LEVER_ARM_MM;
-        float y_mm = (currentData.pitch - anchor.pitch) * LEVER_ARM_MM;
-        strokeBuffer.push_back({x_mm, y_mm, currentData.accel_z});
+        // Record raw sensor values — the ML model learns from these directly
+        strokeBuffer.push_back({currentData.ax, currentData.ay, currentData.az,
+                                currentData.gx, currentData.gy, currentData.gz});
 
         // 3. IDLE TIMEOUT -> TRIGGER AI INFERENCE!
         if ((elapsedMs - lastActiveTime) > IDLE_TIMEOUT_MS) {
