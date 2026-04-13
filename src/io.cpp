@@ -1,16 +1,69 @@
 #include "pen/io.hpp"
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <termios.h>
 #include <unistd.h>
+#include <vector>
 
 namespace pen {
 
 static constexpr float DEG_TO_RAD = static_cast<float>(M_PI / 180.0);
+namespace fs = std::filesystem;
+
+namespace {
+std::string devRoot() {
+  const char *root = std::getenv("INERTIALINK_DEV_ROOT");
+  return (root && *root) ? root : "/dev";
+}
+
+bool containsAnyToken(const std::string &value,
+                      const std::vector<std::string> &tokens) {
+  std::string lower = value;
+  for (char &c : lower)
+    c = static_cast<char>(std::tolower(c));
+
+  for (const auto &t : tokens) {
+    if (lower.find(t) != std::string::npos)
+      return true;
+  }
+  return false;
+}
+
+std::vector<std::string> scanCandidatePorts() {
+  std::vector<std::string> ports;
+  const std::string root = devRoot();
+  const std::vector<std::string> idTokens = {"esp32", "cp210", "ch340", "wch", "silicon_labs"};
+  const fs::path byId = fs::path(root) / "serial" / "by-id";
+
+  if (fs::exists(byId) && fs::is_directory(byId)) {
+    for (const auto &entry : fs::directory_iterator(byId)) {
+      const std::string name = entry.path().filename().string();
+      if (containsAnyToken(name, idTokens)) {
+        std::error_code ec;
+        fs::path resolved = fs::weakly_canonical(entry.path(), ec);
+        if (!ec)
+          ports.push_back(resolved.string());
+      }
+    }
+  }
+
+  for (const auto &entry : fs::directory_iterator(root)) {
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("ttyUSB", 0) == 0 || name.rfind("ttyACM", 0) == 0 ||
+        name.rfind("rfcomm", 0) == 0) {
+      ports.push_back(entry.path().string());
+    }
+  }
+  return ports;
+}
+} // namespace
 
 // ==========================================
 // LOW-PASS FILTER
@@ -173,7 +226,8 @@ bool PenBackend::getLatestData(IMUData &data) {
 std::string PenBackend::getStatus() const { return currentStatus; }
 
 void PenBackend::connectUSB(const std::string &port) {
-  auto reader = std::make_unique<SerialReader>(port);
+  const std::string resolvedPort = device::resolveEsp32Port(port);
+  auto reader = std::make_unique<SerialReader>(resolvedPort.empty() ? port : resolvedPort);
   filter.reset();
 
   if (reader->isOpen()) {
@@ -187,10 +241,26 @@ void PenBackend::connectUSB(const std::string &port) {
     usleep(250000); // 250 ms: DTR reset settle (not a full boot wait)
     reader->sendCommand("MODE:USB\n");
     currentMode   = ConnectionMode::USB;
-    currentStatus = "Connected via USB (" + port + ")";
+    currentStatus = "Connected via USB (" + (resolvedPort.empty() ? port : resolvedPort) + ")";
   } else {
     currentMode   = ConnectionMode::None;
-    currentStatus = "USB Failed (" + port + ")";
+    currentStatus = "USB Failed (" + port + ") - ESP32 not found / not accessible";
+  }
+
+  activeReader = std::move(reader);
+}
+
+void PenBackend::connectBluetooth(const std::string &port) {
+  auto reader = std::make_unique<SerialReader>(port);
+  filter.reset();
+
+  if (reader->isOpen()) {
+    reader->sendCommand("MODE:BT\n");
+    currentMode   = ConnectionMode::Bluetooth;
+    currentStatus = "Connected via Bluetooth (" + port + ")";
+  } else {
+    currentMode   = ConnectionMode::None;
+    currentStatus = "Bluetooth Failed (" + port + ") - check rfcomm binding";
   }
 
   activeReader = std::move(reader);
@@ -214,5 +284,27 @@ void PenBackend::disconnect() {
   currentMode   = ConnectionMode::None;
   currentStatus = "Disconnected";
 }
+
+namespace device {
+bool serialDeviceExists(const std::string &port) {
+  std::error_code ec;
+  return !port.empty() && fs::exists(port, ec);
+}
+
+std::string resolveEsp32Port(const std::string &preferredPort) {
+  if (serialDeviceExists(preferredPort))
+    return preferredPort;
+
+  for (const auto &candidate : scanCandidatePorts()) {
+    if (serialDeviceExists(candidate))
+      return candidate;
+  }
+  return {};
+}
+
+bool esp32DeviceFound(const std::string &preferredPort) {
+  return !resolveEsp32Port(preferredPort).empty();
+}
+} // namespace device
 
 } // namespace pen
