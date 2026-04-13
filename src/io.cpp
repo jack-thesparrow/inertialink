@@ -1,16 +1,68 @@
 #include "pen/io.hpp"
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <termios.h>
 #include <unistd.h>
+#include <vector>
 
 namespace pen {
 
 static constexpr float DEG_TO_RAD = static_cast<float>(M_PI / 180.0);
+namespace fs = std::filesystem;
+
+namespace {
+std::string devRoot() {
+  const char *root = std::getenv("INERTIALINK_DEV_ROOT");
+  return (root && *root) ? root : "/dev";
+}
+
+bool containsAnyToken(const std::string &value,
+                      const std::vector<std::string> &tokens) {
+  std::string lower = value;
+  for (char &c : lower)
+    c = static_cast<char>(std::tolower(c));
+
+  for (const auto &t : tokens) {
+    if (lower.find(t) != std::string::npos)
+      return true;
+  }
+  return false;
+}
+
+std::vector<std::string> scanCandidatePorts() {
+  std::vector<std::string> ports;
+  const std::string root = devRoot();
+  const std::vector<std::string> idTokens = {"esp32", "cp210", "ch340", "wch", "silicon_labs"};
+  const fs::path byId = fs::path(root) / "serial" / "by-id";
+
+  if (fs::exists(byId) && fs::is_directory(byId)) {
+    for (const auto &entry : fs::directory_iterator(byId)) {
+      const std::string name = entry.path().filename().string();
+      if (containsAnyToken(name, idTokens)) {
+        std::error_code ec;
+        fs::path resolved = fs::weakly_canonical(entry.path(), ec);
+        if (!ec)
+          ports.push_back(resolved.string());
+      }
+    }
+  }
+
+  for (const auto &entry : fs::directory_iterator(root)) {
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("ttyUSB", 0) == 0 || name.rfind("ttyACM", 0) == 0) {
+      ports.push_back(entry.path().string());
+    }
+  }
+  return ports;
+}
+} // namespace
 
 // ==========================================
 // LOW-PASS FILTER
@@ -54,11 +106,16 @@ SerialReader::SerialReader(const std::string &portName) : fd(-1), bufPos(0) {
 
   struct termios options;
   tcgetattr(fd, &options);
+  cfmakeraw(&options);
   cfsetispeed(&options, B115200);
   cfsetospeed(&options, B115200);
-  options.c_cflag |=  (CLOCAL | CREAD | CS8);
-  options.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
-  options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+  options.c_cflag |= (CLOCAL | CREAD);
+  options.c_cflag &= ~(CRTSCTS | PARENB | CSTOPB);
+  options.c_cflag &= ~CSIZE;
+  options.c_cflag |= CS8;
+  options.c_cc[VMIN]  = 0;
+  options.c_cc[VTIME] = 1;
+  tcflush(fd, TCIOFLUSH);
   tcsetattr(fd, TCSANOW, &options);
   fcntl(fd, F_SETFL, FNDELAY);
 }
@@ -173,7 +230,8 @@ bool PenBackend::getLatestData(IMUData &data) {
 std::string PenBackend::getStatus() const { return currentStatus; }
 
 void PenBackend::connectUSB(const std::string &port) {
-  auto reader = std::make_unique<SerialReader>(port);
+  const std::string resolvedPort = device::resolveEsp32Port(port);
+  auto reader = std::make_unique<SerialReader>(resolvedPort.empty() ? port : resolvedPort);
   filter.reset();
 
   if (reader->isOpen()) {
@@ -184,16 +242,25 @@ void PenBackend::connectUSB(const std::string &port) {
     // when loop() starts (~1.5–2 s later) and confirms WIRED mode.
     // Apps don't need to wait further — getLatestData() returns false until
     // the ESP32 finishes calibration and starts streaming, then data flows.
-    usleep(250000); // 250 ms: DTR reset settle (not a full boot wait)
+    usleep(300000); // 300 ms: let USB-serial reset settle
+    reader->sendCommand("MODE:USB\n");
+    // Some boards drop the first command while booting/calibrating.
+    usleep(1200000);
     reader->sendCommand("MODE:USB\n");
     currentMode   = ConnectionMode::USB;
-    currentStatus = "Connected via USB (" + port + ")";
+    currentStatus = "Connected via USB (" + (resolvedPort.empty() ? port : resolvedPort) + ")";
   } else {
     currentMode   = ConnectionMode::None;
-    currentStatus = "USB Failed (" + port + ")";
+    currentStatus = "USB Failed (" + port + ") - ESP32 not found / not accessible";
   }
 
   activeReader = std::move(reader);
+}
+
+void PenBackend::connectBluetooth(const std::string &port) {
+  // Compatibility path for stale binaries/objects that still call connectBluetooth.
+  // We no longer support a dedicated BT transport in app flows; treat it as serial.
+  connectUSB(port);
 }
 
 void PenBackend::connectWiFi(int listenPort) {
@@ -214,5 +281,27 @@ void PenBackend::disconnect() {
   currentMode   = ConnectionMode::None;
   currentStatus = "Disconnected";
 }
+
+namespace device {
+bool serialDeviceExists(const std::string &port) {
+  std::error_code ec;
+  return !port.empty() && fs::exists(port, ec);
+}
+
+std::string resolveEsp32Port(const std::string &preferredPort) {
+  if (serialDeviceExists(preferredPort))
+    return preferredPort;
+
+  for (const auto &candidate : scanCandidatePorts()) {
+    if (serialDeviceExists(candidate))
+      return candidate;
+  }
+  return {};
+}
+
+bool esp32DeviceFound(const std::string &preferredPort) {
+  return !resolveEsp32Port(preferredPort).empty();
+}
+} // namespace device
 
 } // namespace pen
