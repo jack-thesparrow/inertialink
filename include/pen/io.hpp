@@ -5,7 +5,7 @@
 namespace pen {
 
 // Connection mode — use this in the UI to drive PenBackend::connect*().
-enum class ConnectionMode { None, USB, WiFi };
+enum class ConnectionMode { None, USB, Bluetooth, WiFi };
 
 // Default port/address values and physics constants.
 // All app-layer code references these — nothing is hardcoded in the apps.
@@ -14,6 +14,7 @@ enum class ConnectionMode { None, USB, WiFi };
 struct Defaults {
   // Connection
   static constexpr const char *usbPort = "/dev/ttyUSB0";
+  static constexpr const char *btPort  = "/dev/rfcomm0";
   // Decoder and visualizer listen on separate ports so both can run
   // simultaneously — SO_REUSEPORT load-balances (one receiver per packet),
   // two ports guarantee each process sees every packet independently.
@@ -105,6 +106,7 @@ public:
   // connectUSB: opens the port and immediately sends "MODE:USB\n" so the
   // firmware starts streaming regardless of its current state.
   void connectUSB(const std::string &port = Defaults::usbPort);
+  void connectBluetooth(const std::string &port = Defaults::btPort);
   void connectWiFi(int listenPort = Defaults::wifiPort);
   void disconnect();
 
@@ -116,5 +118,11 @@ private:
   ConnectionMode currentMode  = ConnectionMode::None;
   std::string    currentStatus = "Disconnected";
 };
+
+namespace device {
+bool serialDeviceExists(const std::string &port);
+bool esp32DeviceFound(const std::string &preferredPort = Defaults::usbPort);
+std::string resolveEsp32Port(const std::string &preferredPort = Defaults::usbPort);
+} // namespace device
 
 } // namespace pen
