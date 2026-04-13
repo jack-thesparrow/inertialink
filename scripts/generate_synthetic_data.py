@@ -228,11 +228,14 @@ def generate_word_data(word: str) -> pd.DataFrame:
         else:
             az = rng.gauss(0.0, 0.01)  # idle: pen lifted
 
-        # Wake impact
+        # Wake impact — spike in total accel magnitude (~2.5g), spread
+        # across axes to match pen held at ~50° writing angle.
         if i == 0:
             ax, ay, az = 0.0, 0.0, 0.0
         elif i == 1:
-            az = 2.5  # Z shockwave from pen hitting paper
+            ax = rng.gauss(0.0, 0.3)   # small lateral jitter
+            ay = 1.8                     # along pen shaft (dominant impact axis)
+            az = 1.5                     # perpendicular to board face
 
         # Gyroscope (deg/s) — angular velocity from wrist rotation
         # The pen acts as a lever arm; lateral velocity produces angular velocity

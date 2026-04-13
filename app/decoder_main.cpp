@@ -315,16 +315,21 @@ int main(int argc, char *argv[]) {
     std::cout << "\n[AI IDLE] Waiting for pen impact...\n";
     writeMode("idle");
 
-    // 1. WAKE-ON-IMPACT LOOP — az spike triggers recording
+    // 1. WAKE-ON-IMPACT LOOP — total accel magnitude spike triggers recording
     bool isWriting = false;
+    float prevMag = 0.0f;
     while (!isWriting) {
       if (backend.getLatestData(currentData)) {
-        if (std::abs(currentData.az - prevData.az) >
-            WAKE_THRESHOLD_Z) {
+        float curMag = std::sqrt(currentData.ax * currentData.ax +
+                                 currentData.ay * currentData.ay +
+                                 currentData.az * currentData.az);
+        float shock  = std::abs(curMag - prevMag);
+        if (shock > WAKE_THRESHOLD_Z) {
           std::cout << "[AI ACTIVE] Impact detected. Reading stroke...\n";
           writeMode("Reading stroke...");
           isWriting = true;
         }
+        prevMag  = curMag;
         prevData = currentData;
       }
     }
@@ -341,14 +346,20 @@ int main(int argc, char *argv[]) {
                              now - startTime)
                              .count();
 
-        // Activity from gyro magnitude + az shock
+        // Activity from gyro magnitude + accel magnitude shock
         float gyroMag = std::sqrt(currentData.gx * currentData.gx +
                                   currentData.gy * currentData.gy +
                                   currentData.gz * currentData.gz);
-        float z_shock = std::abs(currentData.az - prevData.az);
+        float curMag = std::sqrt(currentData.ax * currentData.ax +
+                                 currentData.ay * currentData.ay +
+                                 currentData.az * currentData.az);
+        float pMag   = std::sqrt(prevData.ax * prevData.ax +
+                                 prevData.ay * prevData.ay +
+                                 prevData.az * prevData.az);
+        float shock  = std::abs(curMag - pMag);
 
         if (gyroMag > (ACTIVITY_THRESHOLD * 180.0f / M_PI) ||
-            z_shock > WAKE_THRESHOLD_Z) {
+            shock > WAKE_THRESHOLD_Z) {
           lastActiveTime = elapsedMs;
         }
 

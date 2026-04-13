@@ -31,6 +31,9 @@ struct Defaults {
   static constexpr float activityThreshold = 0.02f;
   // Milliseconds of stillness before a stroke is considered complete.
   static constexpr int   idleTimeoutMs     = 2000;
+  // Mounting tilt: angle (degrees) between pen shaft and the writing surface.
+  // Adjust to match your natural grip (most people 30-45°).
+  static constexpr float tiltAngleDeg      = 35.0f;
 };
 
 struct IMUData {
