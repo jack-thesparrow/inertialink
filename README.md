@@ -3,7 +3,7 @@
 > Motion-sensor handwriting recognition — no camera, no touchscreen, just physics.
 
 Inertialink turns an ESP32 + MPU6050 IMU into a smart pen that streams angular
-velocity over USB, Bluetooth, or WiFi. A BiLSTM + CTC neural network running on
+velocity over USB or WiFi. A BiLSTM + CTC neural network running on
 your desktop decodes the motion into text in real time. A lazygit-style terminal
 UI lets you launch, test, and monitor every component from one screen.
 
@@ -13,7 +13,7 @@ ESP32 / MPU6050                Desktop (C++ + Python)
   pitch                WiFi    ┌──────────────┐    ONNX    ┌───────────┐
   roll    ──100Hz UDP──────▶   │   decoder    │  ───────▶  │  BiLSTM   │
   yaw                          │  (C++/ONNX)  │            │  + CTC    │
-  accel_z             USB/BT   └──────────────┘            └───────────┘
+  accel_z              USB     └──────────────┘            └───────────┘
                   Serial──▶                                      │
                                ┌──────────────┐            "hello" (94%)
                                │  visualizer  │  ◀── stroke trail + HUD
@@ -52,17 +52,16 @@ ESP32 / MPU6050                Desktop (C++ + Python)
 | Microcontroller | ESP32-DEVKIT-C (Xtensa dual-core, 240 MHz) |
 | IMU | MPU6050 (I²C, pins 21 SDA / 22 SCL) |
 | Firmware | PlatformIO + Arduino, `MPU6050_light ^1.1.0` |
-| Baud rate | 115200 (USB / Bluetooth serial) |
+| Baud rate | 115200 (USB serial) |
 | WiFi streaming | UDP → `127.0.0.1:5005` (decoder) + `:5006` (visualizer) |
 | Sample rate | 100 Hz (10 ms per frame) |
 | Lever arm | 150 mm wrist-pivot → pen tip |
 
-The firmware supports **four modes** switchable at runtime via serial commands:
+The firmware supports **three modes** switchable at runtime via serial commands:
 
 | Command | Mode |
 |---------|------|
 | `MODE:USB` | Stream over USB serial |
-| `MODE:BT` | Stream over Bluetooth (`SmartPen_Config`) |
 | `MODE:WIFI\|SSID\|PASS\|HOST_IP` | Connect to WiFi and stream UDP |
 | (default) | IDLE — no streaming |
 
@@ -161,10 +160,9 @@ Press **`1`** to go to the Connection panel and choose your transport:
 |--------|-------------|
 | **WiFi** | ESP32 on the same LAN; sends UDP to ports 5005/5006 |
 | **USB** | Direct cable (`/dev/ttyUSB0`); lowest latency |
-| **Bluetooth** | Wireless but no network needed (`/dev/rfcomm0`) |
 | **Simulation** | No hardware — use Mock ESP32 instead |
 
-> **Serial permissions:** If you get a permission error on USB/Bluetooth, run
+> **Serial permissions:** If you get a permission error on USB, run
 > `sudo usermod -aG dialout $USER` and log out/in.  `bootstrap.sh` does this
 > automatically, but only takes effect after a session restart.
 
@@ -323,10 +321,10 @@ See the [Terminal UI](#terminal-ui) section for the full key reference.
  ★  Inertialink Smart Pen
 ────────────────────────────────────────────────────────────
  [1] Connection     │  [2] Actions   ↑↓ navigate   Space/Enter run·stop
-  ○ WiFi 5005/5006  │   1  RUN   Visualizer    3D cube + stroke canvas
-  ● USB /dev/ttyUSB0│   2  RUN   Decoder       Real-time AI recognition
-  ○ Bluetooth       │   3  RUN   Collector     Record IMU data to CSV
-  ○ Simulation      │   4  STOP  Mock ESP32    word: hello
+  ● USB /dev/ttyUSB0│   1  RUN   Visualizer    3D cube + stroke canvas
+  ○ WiFi 5005/5006  │   2  RUN   Decoder       Real-time AI recognition
+  ○ Simulation      │   3  RUN   Collector     Record IMU data to CSV
+                    │   4  STOP  Mock ESP32    word: hello
                     │   5  RUN   Train         BiLSTM CTC model training
  Status             │   6  RUN   Evaluate      Batch accuracy on all samples
   ● visualizer      │   Word: hello________________  [Tab] to type
@@ -351,7 +349,7 @@ See the [Terminal UI](#terminal-ui) section for the full key reference.
 
 | Key | Panel | Purpose |
 |-----|-------|---------|
-| `1` | Connection | Pick USB / WiFi / Bluetooth / Simulation |
+| `1` | Connection | Pick USB / WiFi / Simulation |
 | `2` | Actions | Start / stop all 6 tools |
 | `3` | Test | Navigate 12-word grid, mark + stream |
 | `4` | Output | Live per-process output, scrollable |
@@ -383,9 +381,8 @@ See the [Terminal UI](#terminal-ui) section for the full key reference.
 Records IMU strokes to CSV for training.
 
 ```bash
-./bin/data_collector hello wifi   # WiFi (default)
-./bin/data_collector hello usb    # USB serial
-./bin/data_collector hello bt     # Bluetooth
+./bin/data_collector hello usb    # USB serial (default)
+./bin/data_collector hello wifi   # WiFi
 ```
 
 Saves to `data/<label>/sample_001.csv`, incrementing automatically.
@@ -397,9 +394,9 @@ Saves to `data/<label>/sample_001.csv`, incrementing automatically.
 Real-time BiLSTM + CTC inference engine.
 
 ```bash
-./bin/decoder          # WiFi, port 5005
+./bin/decoder          # USB serial (default)
 ./bin/decoder usb      # USB serial
-./bin/decoder bt       # Bluetooth
+./bin/decoder wifi     # WiFi, port 5005
 ```
 
 Loads `models/pen_model.onnx`. Writes `/tmp/inertialink_mode` for the
@@ -412,8 +409,9 @@ visualizer HUD. Requires the model to be trained first.
 OpenGL 3.3 Core Profile — 3D cube + stroke trail.
 
 ```bash
-./bin/visualizer           # WiFi, port 5006
+./bin/visualizer           # USB serial (default)
 ./bin/visualizer usb
+./bin/visualizer wifi      # WiFi, port 5006
 ./bin/visualizer sim       # socat virtual TTY at /tmp/vtty_laptop
 ```
 
@@ -479,7 +477,6 @@ All physics constants are in one place: `include/pen/io.hpp`.
 namespace pen {
 struct Defaults {
     static constexpr const char *usbPort        = "/dev/ttyUSB0";
-    static constexpr const char *bluetoothPort  = "/dev/rfcomm0";
     static constexpr int   wifiPort             = 5005;    // decoder UDP
     static constexpr int   wifiVizPort          = 5006;    // visualizer UDP
     static constexpr float leverArmMm           = 150.0f;  // wrist → pen tip
