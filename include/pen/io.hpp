@@ -14,6 +14,7 @@ enum class ConnectionMode { None, USB, Bluetooth, WiFi };
 struct Defaults {
   // Connection
   static constexpr const char *usbPort = "/dev/ttyUSB0";
+  // Backward-compat alias for older app objects that still reference btPort.
   static constexpr const char *btPort  = "/dev/rfcomm0";
   // Decoder and visualizer listen on separate ports so both can run
   // simultaneously — SO_REUSEPORT load-balances (one receiver per packet),
@@ -106,6 +107,7 @@ public:
   // connectUSB: opens the port and immediately sends "MODE:USB\n" so the
   // firmware starts streaming regardless of its current state.
   void connectUSB(const std::string &port = Defaults::usbPort);
+  // Backward-compat shim: Bluetooth transport is deprecated; this falls back to USB handling.
   void connectBluetooth(const std::string &port = Defaults::btPort);
   void connectWiFi(int listenPort = Defaults::wifiPort);
   void disconnect();

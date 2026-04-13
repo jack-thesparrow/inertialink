@@ -257,6 +257,12 @@ void PenBackend::connectUSB(const std::string &port) {
   activeReader = std::move(reader);
 }
 
+void PenBackend::connectBluetooth(const std::string &port) {
+  // Compatibility path for stale binaries/objects that still call connectBluetooth.
+  // We no longer support a dedicated BT transport in app flows; treat it as serial.
+  connectUSB(port);
+}
+
 void PenBackend::connectWiFi(int listenPort) {
   activeReader = std::make_unique<UDPReader>(listenPort);
   filter.reset();
