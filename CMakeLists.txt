@@ -28,3 +28,6 @@ add_subdirectory(src)
 
 # 3. Build the executables
 add_subdirectory(app)
+
+enable_testing()
+add_subdirectory(tests)

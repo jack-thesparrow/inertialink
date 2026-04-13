@@ -117,4 +117,10 @@ private:
   std::string    currentStatus = "Disconnected";
 };
 
+namespace device {
+bool serialDeviceExists(const std::string &port);
+bool esp32DeviceFound(const std::string &preferredPort = Defaults::usbPort);
+std::string resolveEsp32Port(const std::string &preferredPort = Defaults::usbPort);
+} // namespace device
+
 } // namespace pen
