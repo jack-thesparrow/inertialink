@@ -5,7 +5,7 @@
 namespace pen {
 
 // Connection mode — use this in the UI to drive PenBackend::connect*().
-enum class ConnectionMode { None, USB, WiFi };
+enum class ConnectionMode { None, USB, Bluetooth, WiFi };
 
 // Default port/address values and physics constants.
 // All app-layer code references these — nothing is hardcoded in the apps.
