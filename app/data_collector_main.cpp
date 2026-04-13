@@ -57,7 +57,7 @@ int main(int argc, char *argv[]) {
   }
 
   std::string label = argv[1];
-  std::string mode = (argc > 2) ? argv[2] : "wifi";
+  std::string mode = (argc > 2) ? argv[2] : "usb";
   std::string baseDir = "data/" + label;
   if (!fs::exists(baseDir))
     fs::create_directories(baseDir);
@@ -66,7 +66,9 @@ int main(int argc, char *argv[]) {
   if (mode == "usb")
     backend.connectUSB(pen::Defaults::usbPort);
   else if (mode == "bt")
-    backend.connectBluetooth(pen::Defaults::bluetoothPort);
+    backend.connectBluetooth(pen::Defaults::btPort);
+  else if (mode == "sim")
+    backend.connectUSB("/tmp/vtty_laptop");
   else
     backend.connectWiFi(pen::Defaults::wifiPort);
 

@@ -1,5 +1,9 @@
 include(FetchContent)
 
+# Some environments stall for a long time during GLFW's
+# `check_function_exists(shmat ...)`. Pre-seed the result to skip that probe.
+set(HAVE_SHMAT 1 CACHE INTERNAL "Skip GLFW shmat probe" FORCE)
+
 # --- GLFW SETUP ---
 # Disable GLFW tests, examples, and docs to prevent warnings and bin/ clutter!
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -68,4 +72,3 @@ FetchContent_Declare(ftxui
     GIT_TAG        v5.0.0
 )
 FetchContent_MakeAvailable(ftxui)
-
