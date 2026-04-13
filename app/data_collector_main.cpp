@@ -93,14 +93,20 @@ int main(int argc, char *argv[]) {
 
     // 1. WAKE-ON-IMPACT LOOP — az spike triggers recording
     bool isWriting = false;
+    float prevMag = 0.0f;
     while (!isWriting) {
       if (backend.getLatestData(currentData)) {
-        float z_shock = std::abs(currentData.az - prevData.az);
+        // Mounting-independent: total acceleration magnitude spike
+        float curMag = std::sqrt(currentData.ax * currentData.ax +
+                                 currentData.ay * currentData.ay +
+                                 currentData.az * currentData.az);
+        float shock  = std::abs(curMag - prevMag);
 
-        if (z_shock > WAKE_THRESHOLD_Z) {
+        if (shock > WAKE_THRESHOLD_Z) {
           std::cout << "[RECORDING] Impact detected! Writing...\n";
           isWriting = true;
         }
+        prevMag  = curMag;
         prevData = currentData;
       }
     }
@@ -122,11 +128,18 @@ int main(int argc, char *argv[]) {
         float gyroMag = std::sqrt(currentData.gx * currentData.gx +
                                   currentData.gy * currentData.gy +
                                   currentData.gz * currentData.gz);
-        float z_shock = std::abs(currentData.az - prevData.az);
+        // Mounting-independent impact: total acceleration magnitude
+        float curMag = std::sqrt(currentData.ax * currentData.ax +
+                                 currentData.ay * currentData.ay +
+                                 currentData.az * currentData.az);
+        float pMag   = std::sqrt(prevData.ax * prevData.ax +
+                                 prevData.ay * prevData.ay +
+                                 prevData.az * prevData.az);
+        float shock  = std::abs(curMag - pMag);
 
         // If the pen is moving (gyro activity) or tapping, reset the sleep timer
         if (gyroMag > (ACTIVITY_THRESHOLD * 180.0f / M_PI) ||
-            z_shock > WAKE_THRESHOLD_Z) {
+            shock > WAKE_THRESHOLD_Z) {
           lastActiveTime = elapsedMs;
         }
 

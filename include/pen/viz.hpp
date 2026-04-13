@@ -7,6 +7,10 @@
 struct GLFWwindow;
 
 namespace pen {
+
+// Pen contact state machine
+enum class PenState { IDLE, WRITING, LIFTED };
+
 class Visualizer {
 public:
   Visualizer(int width, int height, const char *title);
@@ -34,10 +38,26 @@ private:
   IMUData  prevIMU;
   bool     prevIMUValid{false};
 
-  // Integrated gyro orientation (radians) — used for cube rotation and 2D canvas
+  // Integrated gyro orientation (radians) — used for cube rotation
   float intPitch{0.0f}, intRoll{0.0f}, intYaw{0.0f};
+  // Raw GZ integration for canvas horizontal axis (no tilt compensation —
+  // calibration showed tilt comp causes 598% cross-axis bleed)
+  float intRawGZ{0.0f};
   // Anchor values at stroke start — cube rotates relative to these
   float anchorPitch{0.0f}, anchorRoll{0.0f}, anchorYaw{0.0f};
+  float anchorRawGZ{0.0f};
+
+  // ── Translation tracking (complementary filter + double integration) ──
+  glm::vec3 gravity{0.0f, 0.0f, 1.0f};   // estimated gravity in sensor frame (g)
+  glm::vec3 velocity{0.0f};                // integrated dynamic acceleration (m/s)
+  glm::vec3 position{0.0f};                // integrated velocity (m)
+  glm::vec3 posAnchor{0.0f};               // position at stroke start
+
+  // ── Jerk-based pen state ──
+  PenState  penState{PenState::IDLE};
+  float     prevAccelMag{1.0f};             // previous total accel magnitude
+  float     prevJerk{0.0f};                 // previous jerk (for smoothing)
+  int       quietFrames{0};                 // consecutive low-jerk frames
 
   // HUD state (polled from /tmp/inertialink_word and /tmp/inertialink_mode)
   int         frameCount{0};
