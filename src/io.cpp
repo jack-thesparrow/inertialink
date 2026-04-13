@@ -56,8 +56,7 @@ std::vector<std::string> scanCandidatePorts() {
 
   for (const auto &entry : fs::directory_iterator(root)) {
     const std::string name = entry.path().filename().string();
-    if (name.rfind("ttyUSB", 0) == 0 || name.rfind("ttyACM", 0) == 0 ||
-        name.rfind("rfcomm", 0) == 0) {
+    if (name.rfind("ttyUSB", 0) == 0 || name.rfind("ttyACM", 0) == 0) {
       ports.push_back(entry.path().string());
     }
   }
@@ -107,11 +106,16 @@ SerialReader::SerialReader(const std::string &portName) : fd(-1), bufPos(0) {
 
   struct termios options;
   tcgetattr(fd, &options);
+  cfmakeraw(&options);
   cfsetispeed(&options, B115200);
   cfsetospeed(&options, B115200);
-  options.c_cflag |=  (CLOCAL | CREAD | CS8);
-  options.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
-  options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+  options.c_cflag |= (CLOCAL | CREAD);
+  options.c_cflag &= ~(CRTSCTS | PARENB | CSTOPB);
+  options.c_cflag &= ~CSIZE;
+  options.c_cflag |= CS8;
+  options.c_cc[VMIN]  = 0;
+  options.c_cc[VTIME] = 1;
+  tcflush(fd, TCIOFLUSH);
   tcsetattr(fd, TCSANOW, &options);
   fcntl(fd, F_SETFL, FNDELAY);
 }
@@ -238,29 +242,16 @@ void PenBackend::connectUSB(const std::string &port) {
     // when loop() starts (~1.5–2 s later) and confirms WIRED mode.
     // Apps don't need to wait further — getLatestData() returns false until
     // the ESP32 finishes calibration and starts streaming, then data flows.
-    usleep(250000); // 250 ms: DTR reset settle (not a full boot wait)
+    usleep(300000); // 300 ms: let USB-serial reset settle
+    reader->sendCommand("MODE:USB\n");
+    // Some boards drop the first command while booting/calibrating.
+    usleep(1200000);
     reader->sendCommand("MODE:USB\n");
     currentMode   = ConnectionMode::USB;
     currentStatus = "Connected via USB (" + (resolvedPort.empty() ? port : resolvedPort) + ")";
   } else {
     currentMode   = ConnectionMode::None;
     currentStatus = "USB Failed (" + port + ") - ESP32 not found / not accessible";
-  }
-
-  activeReader = std::move(reader);
-}
-
-void PenBackend::connectBluetooth(const std::string &port) {
-  auto reader = std::make_unique<SerialReader>(port);
-  filter.reset();
-
-  if (reader->isOpen()) {
-    reader->sendCommand("MODE:BT\n");
-    currentMode   = ConnectionMode::Bluetooth;
-    currentStatus = "Connected via Bluetooth (" + port + ")";
-  } else {
-    currentMode   = ConnectionMode::None;
-    currentStatus = "Bluetooth Failed (" + port + ") - check rfcomm binding";
   }
 
   activeReader = std::move(reader);

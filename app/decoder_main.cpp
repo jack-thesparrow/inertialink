@@ -279,9 +279,8 @@ int main(int argc, char *argv[]) {
   // process exits — making predictions invisible during a session.
   std::cout.setf(std::ios::unitbuf);
 
-  // Default to "wifi" so `./bin/decoder` works out-of-the-box with mock_esp32.py.
-  // Use "usb" or "bt" for physical hardware.
-  std::string mode = (argc > 1) ? argv[1] : "wifi";
+  // Default to "usb" for wired ESP32 usage.
+  std::string mode = (argc > 1) ? argv[1] : "usb";
 
   writeMode("idle");
 
@@ -318,7 +317,7 @@ int main(int argc, char *argv[]) {
     backend.connectBluetooth(pen::Defaults::btPort);
   else if (mode == "sim")
     backend.connectUSB("/tmp/vtty_laptop");
-  else // "wifi" (default) — matches mock_esp32.py
+  else // "wifi" — matches mock_esp32.py
     backend.connectWiFi(pen::Defaults::wifiPort);
 
   // Alpha=1.0 bypasses the low-pass filter (passthrough).

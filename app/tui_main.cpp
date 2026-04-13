@@ -4,7 +4,7 @@
 // Fully responsive (re-lays out on every resize event via FTXUI).
 //
 // Panels  (Tab cycles through them):
-//   0  Connection   — Radiobox: WiFi / USB / Bluetooth / Simulation
+//   0  Connection   — Radiobox: USB / WiFi / Simulation
 //   1  Actions      — 6 tools; ↑↓ navigate, Space/Enter toggle run·stop
 //   2  Mock input   — word / 'all' text field (only when Mock ESP32 on cursor)
 //   3  Test panel   — 12-word grid; ↑↓←→ navigate, Space mark, Enter stream, A all
@@ -127,13 +127,12 @@ int main() {
   // ── Connection ─────────────────────────────────────────────────────────────
   int conn = 0;
   const std::vector<std::string> kConnLabels = {
+      std::string("USB        (") + pen::Defaults::usbPort + ")",
       "WiFi       (port " + std::to_string(pen::Defaults::wifiPort)
                           + "/" + std::to_string(pen::Defaults::wifiVizPort) + ")",
-      std::string("USB        (") + pen::Defaults::usbPort + ")",
-      std::string("Bluetooth  (") + pen::Defaults::btPort + ")",
       "Simulation (/tmp/vtty_laptop)",
   };
-  const std::vector<std::string> kConnArgs = {"wifi", "usb", "bt", "sim"};
+  const std::vector<std::string> kConnArgs = {"usb", "wifi", "sim"};
 
   // ── Actions ────────────────────────────────────────────────────────────────
   struct ActionDef {

@@ -57,7 +57,7 @@ int main(int argc, char *argv[]) {
   }
 
   std::string label = argv[1];
-  std::string mode = (argc > 2) ? argv[2] : "wifi";
+  std::string mode = (argc > 2) ? argv[2] : "usb";
   std::string baseDir = "data/" + label;
   if (!fs::exists(baseDir))
     fs::create_directories(baseDir);

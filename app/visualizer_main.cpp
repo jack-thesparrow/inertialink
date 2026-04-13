@@ -5,7 +5,7 @@
 
 int main(int argc, char *argv[]) {
   // Usage:
-  //   ./bin/visualizer            → WiFi UDP port 5006  (default)
+  //   ./bin/visualizer            → USB /dev/ttyUSB0  (default)
   //   ./bin/visualizer wifi       → WiFi UDP port 5006
   //   ./bin/visualizer usb        → /dev/ttyUSB0   (sends MODE:USB to firmware)
   //   ./bin/visualizer sim        → /tmp/vtty_laptop  (socat virtual cable)
@@ -17,7 +17,7 @@ int main(int argc, char *argv[]) {
   //   C   — clear stroke canvas
   //   ESC — quit
 
-  std::string mode = (argc > 1) ? argv[1] : "wifi";
+  std::string mode = (argc > 1) ? argv[1] : "usb";
 
   pen::PenBackend backend;
   if (mode == "usb")
@@ -26,7 +26,7 @@ int main(int argc, char *argv[]) {
     backend.connectBluetooth(pen::Defaults::btPort);
   else if (mode == "sim")
     backend.connectUSB("/tmp/vtty_laptop");
-  else // "wifi" (default)
+  else // "wifi"
     backend.connectWiFi(pen::Defaults::wifiVizPort);
 
   std::cout << "=== Smart Pen Visualizer ===\n";
