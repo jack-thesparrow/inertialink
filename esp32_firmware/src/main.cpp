@@ -1,7 +1,17 @@
-// InertiaLink ESP32 Firmware — USB + WiFi only (no Bluetooth)
+// InertiaLink ESP32 Firmware — USB + SoftAP WiFi (no router required)
 //
 // Default boot mode: WIRED.  The desktop apps open the port and expect
 // data immediately; no MODE:USB command needed before streaming begins.
+//
+// WiFi transport: ESP32 runs as a SoftAP — the laptop connects directly to
+// the pen's own network.  No router, no credentials to flash, no host IP to
+// configure.  The pen always broadcasts UDP to 192.168.4.255:5005 so any
+// connected laptop receives it without knowing the pen's DHCP assignments.
+//
+//   AP SSID     : InertiaLink
+//   AP password : inertia123
+//   ESP32 IP    : 192.168.4.1  (fixed, default SoftAP address)
+//   Laptop IP   : 192.168.4.2  (first DHCP lease — assigned automatically)
 //
 // Wiring:
 //   MPU6050   SDA→GPIO 21   SCL→GPIO 22   I2C address 0x68
@@ -10,63 +20,56 @@
 //   Btn2      GPIO 27 ↔ GND   —  forces  WIRED
 //
 // Serial commands at 115200 baud (TUI or any terminal):
-//   MODE:USB                        switch to / stay in WIRED mode
-//   MODE:WIFI|<ssid>|<pass>|<host>  connect WiFi, stream to host:5005
-//   MODE:IDLE                       pause streaming
+//   MODE:USB    switch to / stay in WIRED mode
+//   MODE:WIFI   switch to SoftAP WiFi mode (AP is always running)
+//   MODE:IDLE   pause streaming
 //
 // Payload format (sent in WIRED/WIFI modes at 100 Hz):
-//   pitch,roll,yaw,accel_z\n   (all floats, degrees + g's)
-//   The 4th field (accel_z from mpu.getAccZ()) is the raw Z-axis
-//   acceleration in g.  It is REQUIRED by the PC-side apps:
-//     • data_collector / decoder  — wake-on-impact:  |az – prev_az| > 0.5
-//     • visualizer 2D canvas      — pen-contact test: |az| >= 0.05
-//   Without it the 2D canvas never draws and the collector never wakes.
+//   ax,ay,az,gx,gy,gz\n   (floats: g-force + deg/s)
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Arduino.h>
 #include <MPU6050_light.h>
-#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
 
-Preferences prefs;
+// ── SoftAP credentials (hardcoded — no NVS needed) ───────────────────────────
+// #define so string-literal concatenation ("prefix" AP_SSID) compiles.
+#define AP_SSID "InertiaLink"
+#define AP_PASS "inertia123"
+// Broadcast to all clients on the AP subnet — no laptop IP config required.
+static constexpr const char *UDP_TARGET  = "192.168.4.255";
+static constexpr int UDP_PORT_DECODER    = 5005; // decoder
+static constexpr int UDP_PORT_VISUALIZER = 5006; // visualizer
 
-// ── OLED ──────────────────────────────────────────────────────────────────────
-// Robocraze 0.96" 4-pin yellow-blue OLED, SSD1306, 128×64.
-// Hardware colour split (fixed by the panel, not the driver):
-//   top 16 px  → yellow     bottom 48 px → blue
-//
-// Wire runs at 400 kHz (fast mode).
-// Default 100 kHz ≈ 92 ms per full-frame push → would block the 100 Hz loop.
-// 400 kHz ≈ 23 ms → acceptable overhead.
-#define SCREEN_W  128
-#define SCREEN_H   64
+// ── OLED
+// ──────────────────────────────────────────────────────────────────────
+#define SCREEN_W 128
+#define SCREEN_H 64
 #define OLED_ADDR 0x3C
 static Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, /*reset=*/-1);
 static bool oledOk = false;
 
-// ── Push buttons (active-LOW, internal pull-up) ───────────────────────────────
-#define BTN_CYCLE_PIN  14   // toggle WIRED ↔ WIFI
-#define BTN_RESET_PIN  27   // force WIRED
-#define DEBOUNCE_MS   200
+// ── Push buttons (active-LOW, internal pull-up)
+// ───────────────────────────────
+#define BTN_CYCLE_PIN 14 // toggle WIRED ↔ WIFI
+#define BTN_RESET_PIN 27 // force WIRED
+#define DEBOUNCE_MS 200
 static unsigned long lastBtn1Ms = 0, lastBtn2Ms = 0;
 
-// ── Non-blocking serial command buffer ────────────────────────────────────────
-// Serial.readStringUntil() blocks up to Serial.getTimeout() (default 1 s) when
-// bytes arrive without a '\n'.  That stalls the 100 Hz loop.  This char-by-char
-// buffer never blocks.
+// ── Non-blocking serial command buffer
+// ────────────────────────────────────────
 static char cmdBuf[128];
-static int  cmdPos = 0;
+static int cmdPos = 0;
 
-// ── Mode & radio state ────────────────────────────────────────────────────────
+// ── Mode & radio state
+// ────────────────────────────────────────────────────────
 enum Mode { WIRED, WIFI, IDLE };
 
-static Mode   currentMode    = WIRED;   // boot default: stream over USB immediately
-static bool   wifiReady      = false;
-static String wifiTargetIP   = "";
-static int    wifiTargetPort = 5005;
+static Mode currentMode = WIRED; // boot default: stream over USB immediately
+static bool apReady = false;     // set true once SoftAP is up
 
 static MPU6050 mpu(Wire);
 static WiFiUDP udp;
@@ -75,121 +78,139 @@ static WiFiUDP udp;
 static float imu_ax = 0.0f, imu_ay = 0.0f, imu_az = 0.0f;
 static float imu_gx = 0.0f, imu_gy = 0.0f, imu_gz = 0.0f;
 
-// ── OLED helpers ──────────────────────────────────────────────────────────────
+// ── OLED helpers
+// ──────────────────────────────────────────────────────────────
 static const char *modeName(Mode m) {
   switch (m) {
-    case WIRED: return "WIRED";
-    case WIFI:  return "WIFI ";
-    default:    return "IDLE ";
+  case WIRED:
+    return "WIRED";
+  case WIFI:
+    return "WIFI ";
+  default:
+    return "IDLE ";
   }
 }
 
-// ── drawDisplay ───────────────────────────────────────────────────────────────
+// ── drawDisplay
+// ───────────────────────────────────────────────────────────────
 //
-// Display layout (128×64 px, textSize=1 → 6×8 px/char, 21 chars/row):
+// Panel colour zones (fixed by hardware — not configurable):
+//   y  0–15  → YELLOW   (16 px, 2 text rows)
+//   y 16–63  → BLUE     (48 px, 6 text rows)
 //
-//  ┌─────── YELLOW zone (y 0–15) ────────┐
-//  │ WIRED     [*] LIVE                  │  ← Row 0 y=1 : mode + live badge
-//  │ P:+12.3     R:-4.6                  │  ← Row 1 y=9 : pitch & roll
-//  ├─────── BLUE zone   (y 16–63) ───────┤
-//  │▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│  ← inverted box y=17–28
-//  │▓  Yaw : +089.01 deg              ▓│  ← Row y=20, black-on-white
-//  │▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│
-//  │  -> 192.168.1.100                   │  ← WiFi IP (WiFi mode only) y=31
-//  │ ─────────────────────────────────── │  ← separator y=41
-//  │ [B1] -> WIFI                        │  ← button hint y=45
-//  │ [B2] -> WIRED                       │  ← button hint y=55
-//  └─────────────────────────────────────┘
-//
-// The yellow zone is an inverted rectangle (fillRect WHITE → drawn in yellow
-// on the physical display with black text on top).
-// The "Yaw box" inside the blue zone is a second inverted strip — it appears
-// as a bright blue band against the surrounding dark blue, making the yaw
-// reading visually pop.
+//  ┌──────── YELLOW zone ────────────────────────────────────────┐
+//  │ ▓WIRED▓   WIFI    IDLE                                     │ y=0 tabs
+//  │ [*] LIVE   AP:InertiaLink  /  USB 115200                   │ y=9
+//  ├──────── BLUE zone ──────────────────────────────────────────┤
+//  │ AX:+1.23  AY:-0.45                                         │ y=18
+//  │ AZ:+0.98  GZ: +89.0                                        │ y=27
+//  │▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│ inverted band
+//  │▓ GX:+12.3  GY: -5.6                                      ▓│ y=37
+//  │▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│
+//  │──────────────────────────────────────────────────────────── │ sep y=47
+//  │ B1:->WIFI   B2:WIRED                                       │ y=55
+//  └─────────────────────────────────────────────────────────────┘
 
-static uint8_t animTick = 0;  // incremented each drawDisplay() call
+static uint8_t animTick = 0;
 
 static void drawDisplay() {
-  if (!oledOk) return;
+  if (!oledOk)
+    return;
   animTick++;
-  // Live badge blinks at ~1.25 Hz: 4 calls × 100 ms = 400 ms on/off
-  bool liveOn = (animTick >> 2) & 1;
+  bool liveOn = (animTick >> 2) & 1; // blinks ~1.25 Hz
 
   display.clearDisplay();
-
-  // ════ YELLOW ZONE ══════════════════════════════════════════════════════════
-  display.fillRect(0, 0, SCREEN_W, 16, SSD1306_WHITE);
-  display.setTextColor(SSD1306_BLACK);
   display.setTextSize(1);
 
-  if (currentMode == IDLE) {
-    display.setCursor(10, 1); display.print("* InertiaLink v2 *");
-    display.setCursor(14, 9); display.print("USB + WiFi   no BT");
-  } else {
-    // Row 0 — mode label + animated live badge
-    char row0[22];
-    snprintf(row0, sizeof(row0), "%-5s    %s",
-             modeName(currentMode), liveOn ? "[*] LIVE" : "[ ] live");
-    display.setCursor(0, 1);
-    display.print(row0);
+  // ════ YELLOW ZONE ══════════════════════════════════════════════════════════
+  // Fill the whole zone white — the panel renders this as yellow.
+  display.fillRect(0, 0, SCREEN_W, 16, SSD1306_WHITE);
 
-    // Row 1 — accel X & Y: most frequently glanced values
-    char row1[22];
-    snprintf(row1, sizeof(row1), "AX:%+5.2f AY:%+5.2f", imu_ax, imu_ay);
-    display.setCursor(0, 9);
-    display.print(row1);
+  // ── Row 0 (y=0–8): three mode tabs, active tab inverted ────────────────────
+  // Tab x-positions spread across 128 px.
+  static const struct { const char *label; uint8_t x; Mode mode; } TABS[] = {
+    {"WIRED",  2, WIRED},
+    {"WIFI",  50, WIFI },
+    {"IDLE",  96, IDLE },
+  };
+  for (const auto &t : TABS) {
+    if (currentMode == t.mode) {
+      // Active: black box filled in the yellow stripe → appears as dark tab
+      uint8_t w = static_cast<uint8_t>(strlen(t.label) * 6);
+      display.fillRect(t.x - 1, 0, w + 2, 9, SSD1306_BLACK);
+      display.setTextColor(SSD1306_WHITE);
+    } else {
+      display.setTextColor(SSD1306_BLACK);
+    }
+    display.setCursor(t.x, 1);
+    display.print(t.label);
+  }
+
+  // ── Row 1 (y=9–15): live badge + transport info ────────────────────────────
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(0, 9);
+  if (currentMode == WIFI) {
+    // Show AP SSID so the user sees what network to join
+    char r[22];
+    snprintf(r, sizeof(r), "%s AP:%-11s", liveOn ? "[*]" : "[ ]", AP_SSID);
+    display.print(r);
+  } else if (currentMode == WIRED) {
+    char r[22];
+    snprintf(r, sizeof(r), "%s USB 115200 baud", liveOn ? "[*]" : "[ ]");
+    display.print(r);
+  } else {
+    display.setCursor(22, 9);
+    display.print("--- paused ---");
   }
 
   // ════ BLUE ZONE ════════════════════════════════════════════════════════════
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
 
   if (currentMode == IDLE) {
-    display.setCursor(0, 18); display.print("Awaiting command...");
-    display.setCursor(0, 30); display.print("[Btn1] Cycle mode");
-    display.setCursor(0, 40); display.print("[Btn2] Force WIRED");
-    display.setCursor(0, 52); display.print("TUI: MODE:WIFI|...");
+    display.setCursor(0, 19); display.print("[B1] Cycle mode");
+    display.setCursor(0, 29); display.print("[B2] Force WIRED");
+    display.setCursor(0, 41); display.print("AP:  " AP_SSID);
+    display.setCursor(0, 51); display.print("pw:  " AP_PASS);
     display.display();
     return;
   }
 
-  // ── Inverted gyro box ────────────────────────────────────────────────────────
-  display.fillRect(0, 17, SCREEN_W, 12, SSD1306_WHITE);
+  // ── 6-DOF readings ─────────────────────────────────────────────────────────
+  char buf[22];
+
+  // Accel X & Y
+  snprintf(buf, sizeof(buf), "AX:%+5.2f  AY:%+5.2f", imu_ax, imu_ay);
+  display.setCursor(0, 18);
+  display.print(buf);
+
+  // Accel Z + Gyro Z (primary writing-motion channels)
+  snprintf(buf, sizeof(buf), "AZ:%+5.2f  GZ:%+6.1f", imu_az, imu_gz);
+  display.setCursor(0, 27);
+  display.print(buf);
+
+  // Gyro X & Y — inverted band for contrast against the blue background
+  display.fillRect(0, 36, SCREEN_W, 9, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
-  char gyroBuf[22];
-  snprintf(gyroBuf, sizeof(gyroBuf), "GZ:%+7.1f d/s", imu_gz);
-  display.setCursor(0, 20);
-  display.print(gyroBuf);
+  snprintf(buf, sizeof(buf), "GX:%+5.1f  GY:%+5.1f", imu_gx, imu_gy);
+  display.setCursor(0, 37);
+  display.print(buf);
 
-  // Return to normal white text for the rest of the blue zone
+  // Separator + button hints
   display.setTextColor(SSD1306_WHITE);
-
-  // WiFi target IP (only in WIFI mode)
-  if (currentMode == WIFI && wifiTargetIP.length() > 0) {
-    display.setCursor(0, 31);
-    display.print("-> ");
-    display.print(wifiTargetIP.substring(0, 18).c_str());
-  }
-
-  // Thin separator
-  display.drawFastHLine(0, 41, SCREEN_W, SSD1306_WHITE);
-
-  // Contextual button hints
-  display.setCursor(0, 45);
-  display.print(currentMode == WIRED ? "[B1] -> WIFI " : "[B1] -> WIRED");
+  display.drawFastHLine(0, 47, SCREEN_W, SSD1306_WHITE);
   display.setCursor(0, 55);
-  display.print("[B2] -> WIRED");
+  display.print(currentMode == WIRED ? "B1:->WIFI   B2:WIRED"
+                                     : "B1:->WIRED  B2:WIRED");
 
   display.display();
 }
 
-// splashOLED: used during boot, WiFi connecting, error screens.
-// Yellow zone = inverted title / blue zone = up to 3 info lines.
-static void splashOLED(const char *title,
-                       const char *line1 = nullptr,
+// splashOLED: used during boot and error screens.
+static void splashOLED(const char *title, const char *line1 = nullptr,
                        const char *line2 = nullptr,
                        const char *line3 = nullptr) {
-  if (!oledOk) return;
+  if (!oledOk)
+    return;
   display.clearDisplay();
 
   display.fillRect(0, 0, SCREEN_W, 16, SSD1306_WHITE);
@@ -199,14 +220,24 @@ static void splashOLED(const char *title,
   display.print(title);
 
   display.setTextColor(SSD1306_WHITE);
-  if (line1) { display.setCursor(0, 20); display.print(line1); }
-  if (line2) { display.setCursor(0, 32); display.print(line2); }
-  if (line3) { display.setCursor(0, 44); display.print(line3); }
+  if (line1) {
+    display.setCursor(0, 20);
+    display.print(line1);
+  }
+  if (line2) {
+    display.setCursor(0, 32);
+    display.print(line2);
+  }
+  if (line3) {
+    display.setCursor(0, 44);
+    display.print(line3);
+  }
 
   display.display();
 }
 
-// ── Command parser ────────────────────────────────────────────────────────────
+// ── Command parser
+// ────────────────────────────────────────────────────────────
 static void parseCommand(const char *cmd) {
   if (strcmp(cmd, "MODE:USB") == 0) {
     currentMode = WIRED;
@@ -216,57 +247,22 @@ static void parseCommand(const char *cmd) {
     currentMode = IDLE;
     Serial.println("[ESP] Mode -> IDLE");
 
-  } else if (strncmp(cmd, "MODE:WIFI", 9) == 0) {
-    // Expected: MODE:WIFI|<ssid>|<password>|<host_ip>
-    String s(cmd);
-    int a = s.indexOf('|');
-    int b = s.indexOf('|', a + 1);
-    int c = s.indexOf('|', b + 1);
-
-    if (a > 0 && b > 0 && c > 0) {
-      String ssid = s.substring(a + 1, b);
-      String pass = s.substring(b + 1, c);
-      wifiTargetIP = s.substring(c + 1);
-
-      // Save to NVS so it survives a reboot/power bank switch
-      prefs.begin("inetlink", false);
-      prefs.putString("ssid", ssid);
-      prefs.putString("pass", pass);
-      prefs.putString("hostip", wifiTargetIP);
-      prefs.end();
-
-      Serial.println("[ESP] WiFi -> " + ssid);
-      WiFi.begin(ssid.c_str(), pass.c_str());
-
-      for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-        char buf[22];
-        snprintf(buf, sizeof(buf), "Attempt %d/20...", i + 1);
-        splashOLED("Connecting WiFi", ssid.c_str(), buf);
-        delay(500);
-      }
-
-      if (WiFi.status() == WL_CONNECTED) {
-        wifiReady   = true;
-        currentMode = WIFI;
-        Serial.println("[ESP] WiFi OK -> " + wifiTargetIP);
-      } else {
-        wifiReady   = false;
-        currentMode = WIRED;
-        Serial.println("[ESP] WiFi failed -> WIRED");
-        splashOLED("WiFi failed!", "Falling back to", "WIRED mode...");
-        delay(1500);
-      }
+  } else if (strcmp(cmd, "MODE:WIFI") == 0) {
+    // SoftAP is already running since setup() — just flip the mode flag.
+    if (apReady) {
+      currentMode = WIFI;
+      Serial.println("[ESP] Mode -> WIFI (SoftAP: " AP_SSID ")");
+      Serial.println("[ESP] WiFi OK");
+    } else {
+      Serial.println("[ESP] WiFi failed -> SoftAP not ready");
     }
   }
 
   drawDisplay();
 }
 
-// ── Non-blocking serial poll ───────────────────────────────────────────────────
-// Reads all available bytes into cmdBuf one char at a time.
-// Calls parseCommand() only when a complete '\n'-terminated line arrives.
-// This never stalls the loop — Serial.readStringUntil() would block 1 s on
-// a partial line.
+// ── Non-blocking serial poll
+// ───────────────────────────────────────────────────
 static void pollSerial() {
   while (Serial.available()) {
     char c = static_cast<char>(Serial.read());
@@ -282,19 +278,20 @@ static void pollSerial() {
   }
 }
 
-// ── Button handler ────────────────────────────────────────────────────────────
+// ── Button handler
+// ────────────────────────────────────────────────────────────
 static void handleButtons() {
   unsigned long now = millis();
 
-  // Btn1: WIRED → WIFI (if credentials ready) / WIFI or IDLE → WIRED
+  // Btn1: WIRED → WIFI (if AP is up) / WIFI or IDLE → WIRED
   if (digitalRead(BTN_CYCLE_PIN) == LOW && (now - lastBtn1Ms) > DEBOUNCE_MS) {
     lastBtn1Ms = now;
     if (currentMode == WIRED) {
-      if (wifiReady) {
+      if (apReady) {
         currentMode = WIFI;
         Serial.println("[ESP] Btn1 -> WIFI");
       } else {
-        splashOLED("No WiFi config!", "Send from TUI:", "MODE:WIFI|...");
+        splashOLED("SoftAP error!", "AP failed to start", "Try reboot");
         delay(1500);
       }
     } else {
@@ -306,14 +303,15 @@ static void handleButtons() {
 
   // Btn2: force WIRED from any mode
   if (digitalRead(BTN_RESET_PIN) == LOW && (now - lastBtn2Ms) > DEBOUNCE_MS) {
-    lastBtn2Ms  = now;
+    lastBtn2Ms = now;
     currentMode = WIRED;
     Serial.println("[ESP] Btn2 -> WIRED");
     drawDisplay();
   }
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
+// ── Setup
+// ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
@@ -321,7 +319,6 @@ void setup() {
   pinMode(BTN_RESET_PIN, INPUT_PULLUP);
 
   // 400 kHz I2C: reduces display.display() from ~92 ms to ~23 ms per frame.
-  // Both MPU6050 and SSD1306 support 400 kHz.
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
@@ -330,70 +327,49 @@ void setup() {
   if (!oledOk)
     Serial.println("[ESP] OLED absent — headless");
 
-  splashOLED("InertiaLink v2", "Booting...", "USB + WiFi only");
+  splashOLED("InertiaLink v2", "Booting...", "USB + SoftAP WiFi");
 
   // MPU6050 — fatal if absent
   if (mpu.begin() != 0) {
-    splashOLED("MPU6050 Error!", "Check I2C wiring",
-               "SDA=21  SCL=22");
+    splashOLED("MPU6050 Error!", "Check I2C wiring", "SDA=21  SCL=22");
     Serial.println("[ESP] MPU6050 init failed — halting");
-    while (true) delay(10);
+    while (true)
+      delay(10);
   }
 
   splashOLED("Calibrating IMU", "Keep device still");
   delay(1000);
   mpu.calcOffsets();
 
-  // Try to load saved WiFi credentials from flash
-  prefs.begin("inetlink", true); // read-only
-  String savedSSID = prefs.getString("ssid", "");
-  String savedPass = prefs.getString("pass", "");
-  String savedIP   = prefs.getString("hostip", "");
-  prefs.end();
-
-  if (savedSSID.length() > 0) {
-    Serial.println("[ESP] Found saved WiFi: " + savedSSID);
-    wifiTargetIP = savedIP;
-    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
-
-    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-      char buf[22];
-      snprintf(buf, sizeof(buf), "Attempt %d/20...", i + 1);
-      splashOLED("Connecting WiFi", savedSSID.c_str(), buf);
-      delay(500);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiReady   = true;
-      currentMode = WIFI;
-      Serial.println("[ESP] WiFi OK -> " + wifiTargetIP);
-    } else {
-      Serial.println("[ESP] WiFi failed -> WIRED");
-      splashOLED("WiFi failed!", "Falling back to", "WIRED mode...");
-      delay(1500);
-    }
-  }
-
-  if (currentMode == WIFI) {
-      Serial.println("[ESP] Ready — WIFI 100 Hz   accel_z enabled");
+  // Start SoftAP — always on, no router required.
+  // WiFi.softAP() returns immediately; the AP is up within a few ms.
+  splashOLED("Starting SoftAP", AP_SSID, "pw: " AP_PASS);
+  WiFi.mode(WIFI_AP);
+  if (WiFi.softAP(AP_SSID, AP_PASS)) {
+    apReady = true;
+    Serial.println("[ESP] SoftAP up: " AP_SSID " -> 192.168.4.1");
   } else {
-      Serial.println("[ESP] Ready — WIRED 100 Hz   accel_z enabled");
+    Serial.println("[ESP] SoftAP failed — WiFi mode unavailable");
+    splashOLED("SoftAP failed!", "WIRED only");
+    delay(1500);
   }
+
+  Serial.println("[ESP] Ready");
   drawDisplay();
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────────
-static unsigned long lastDispMs  = 0;
+// ── Main loop
+// ─────────────────────────────────────────────────────────────────
+static unsigned long lastDispMs = 0;
 static const unsigned long DISP_INTERVAL_MS = 100; // ~10 Hz OLED refresh
 
 void loop() {
   handleButtons();
-  pollSerial();  // non-blocking; builds cmdBuf, calls parseCommand on '\n'
+  pollSerial();
 
   if (currentMode != IDLE) {
     mpu.update();
 
-    // 6-field raw sensor data: ax,ay,az (g-force), gx,gy,gz (deg/s)
-    // Desktop apps (data_collector, decoder, visualizer) all parse 6 floats.
     float ax = mpu.getAccX();
     float ay = mpu.getAccY();
     float az = mpu.getAccZ();
@@ -401,24 +377,30 @@ void loop() {
     float gy = mpu.getGyroY();
     float gz = mpu.getGyroZ();
 
-    // Update globals for OLED display
-    imu_ax = ax; imu_ay = ay; imu_az = az;
-    imu_gx = gx; imu_gy = gy; imu_gz = gz;
+    imu_ax = ax;
+    imu_ay = ay;
+    imu_az = az;
+    imu_gx = gx;
+    imu_gy = gy;
+    imu_gz = gz;
 
     char payload[80];
-    snprintf(payload, sizeof(payload),
-             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", ax, ay, az, gx, gy, gz);
+    snprintf(payload, sizeof(payload), "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", ax,
+             ay, az, gx, gy, gz);
 
     if (currentMode == WIRED) {
       Serial.print(payload);
     } else {
-      udp.beginPacket(wifiTargetIP.c_str(), wifiTargetPort);
+      // Broadcast to both ports so the decoder and visualizer each
+      // receive every packet independently (no SO_REUSEPORT load-balancing).
+      udp.beginPacket(UDP_TARGET, UDP_PORT_DECODER);
+      udp.print(payload);
+      udp.endPacket();
+      udp.beginPacket(UDP_TARGET, UDP_PORT_VISUALIZER);
       udp.print(payload);
       udp.endPacket();
     }
 
-    // Throttle OLED to ~10 Hz so the 23 ms I2C transfer doesn't eat into
-    // every loop iteration.
     unsigned long now = millis();
     if (now - lastDispMs >= DISP_INTERVAL_MS) {
       lastDispMs = now;
