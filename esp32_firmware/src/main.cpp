@@ -26,9 +26,12 @@
 #include <Adafruit_SSD1306.h>
 #include <Arduino.h>
 #include <MPU6050_light.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
+
+Preferences prefs;
 
 // ── OLED ──────────────────────────────────────────────────────────────────────
 // Robocraze 0.96" 4-pin yellow-blue OLED, SSD1306, 128×64.
@@ -225,6 +228,13 @@ static void parseCommand(const char *cmd) {
       String pass = s.substring(b + 1, c);
       wifiTargetIP = s.substring(c + 1);
 
+      // Save to NVS so it survives a reboot/power bank switch
+      prefs.begin("inetlink", false);
+      prefs.putString("ssid", ssid);
+      prefs.putString("pass", pass);
+      prefs.putString("hostip", wifiTargetIP);
+      prefs.end();
+
       Serial.println("[ESP] WiFi -> " + ssid);
       WiFi.begin(ssid.c_str(), pass.c_str());
 
@@ -334,8 +344,40 @@ void setup() {
   delay(1000);
   mpu.calcOffsets();
 
-  // Signal the PC: firmware is ready and already in WIRED mode.
-  Serial.println("[ESP] Ready — WIRED 100 Hz   accel_z enabled");
+  // Try to load saved WiFi credentials from flash
+  prefs.begin("inetlink", true); // read-only
+  String savedSSID = prefs.getString("ssid", "");
+  String savedPass = prefs.getString("pass", "");
+  String savedIP   = prefs.getString("hostip", "");
+  prefs.end();
+
+  if (savedSSID.length() > 0) {
+    Serial.println("[ESP] Found saved WiFi: " + savedSSID);
+    wifiTargetIP = savedIP;
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+      char buf[22];
+      snprintf(buf, sizeof(buf), "Attempt %d/20...", i + 1);
+      splashOLED("Connecting WiFi", savedSSID.c_str(), buf);
+      delay(500);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiReady   = true;
+      currentMode = WIFI;
+      Serial.println("[ESP] WiFi OK -> " + wifiTargetIP);
+    } else {
+      Serial.println("[ESP] WiFi failed -> WIRED");
+      splashOLED("WiFi failed!", "Falling back to", "WIRED mode...");
+      delay(1500);
+    }
+  }
+
+  if (currentMode == WIFI) {
+      Serial.println("[ESP] Ready — WIFI 100 Hz   accel_z enabled");
+  } else {
+      Serial.println("[ESP] Ready — WIRED 100 Hz   accel_z enabled");
+  }
   drawDisplay();
 }
 

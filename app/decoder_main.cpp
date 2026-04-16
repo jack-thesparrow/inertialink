@@ -1,6 +1,5 @@
 #include "pen/io.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -28,17 +27,16 @@ struct DataPoint {
 // Must match train_bilstm.py ALPHABET exactly.
 // Index 0 ('~') is the CTC blank — always skipped by the decoder.
 // Real characters start at index 1.
-static const std::string ALPHABET =
-    "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static const std::string ALPHABET = "~ 0123456789";
 static constexpr const char *MODEL_PATH = "models/pen_model.onnx";
 
-// Words the model was trained on — must match mock_esp32.py TRAINED_WORDS.
+// Vocabulary the model was trained on: individual characters + words.
 // After beam-search decoding, the raw prediction is snapped to the nearest
-// vocabulary entry (Levenshtein ≤ 2) so that partial drops like "nte"→"note"
-// or "wrld"→"world" are automatically corrected.
+// vocabulary entry (Levenshtein ≤ 2) so that partial drops like "helo"→"hello"
+// are automatically corrected.  Single-char predictions pass through as-is.
 static const std::vector<std::string> VOCABULARY = {
-    "hello", "world", "pen", "123", "write",
-    "note",  "data",  "code","test", "abc", "xyz", "open"};
+    "1", "2", "3"
+};
 
 // ---------------------------------------------------------
 // HELPERS
@@ -303,85 +301,128 @@ int main(int argc, char *argv[]) {
   std::cout << "Mode: " << backend.getStatus() << "\n";
   std::cout << "--------------------------------\n";
 
-  constexpr float WAKE_THRESHOLD_Z   = pen::Defaults::wakeThresholdZ;
-  constexpr float ACTIVITY_THRESHOLD = pen::Defaults::activityThreshold;
-  constexpr int   IDLE_TIMEOUT_MS    = pen::Defaults::idleTimeoutMs;
+  // ── Pen state machine (mirrors visualizer) ──────────────────────────────
+  // IDLE    → waiting for pen impact or movement
+  // WRITING → recording sensor frames into strokeBuffer
+  // LIFTED  → pen lifted; short silence returns to WRITING, long → IDLE + infer
+  enum class PenState { IDLE, WRITING, LIFTED };
+
+  // Activity thresholds — same tuning as visualizer
+  constexpr float DT = 0.01f; // 100 Hz
+  constexpr float JERK_IMPACT_THRESHOLD = 12.0f; // g/s — pen touches paper
+  constexpr float JERK_QUIET_THRESHOLD  = 2.0f;  // g/s — pen is still
+  constexpr float GYRO_ACTIVE_THRESHOLD = 15.0f; // deg/s — pen is moving
+  constexpr float GYRO_QUIET_THRESHOLD  = 5.0f;  // deg/s — pen is still
+  constexpr int   LIFT_QUIET_FRAMES     = 50;    // 500 ms of quiet → LIFTED
+  constexpr int   IDLE_QUIET_FRAMES     = 200;   // 2 s of quiet after lift → IDLE + infer
+  constexpr float JERK_SMOOTH           = 0.3f;
+
+  PenState penState = PenState::IDLE;
+  int      quietFrames = 0;
+  float    prevAccelMag = 1.0f;
+  float    prevJerk = 0.0f;
 
   std::vector<DataPoint> strokeBuffer;
   strokeBuffer.reserve(5000);
-  pen::IMUData currentData, prevData;
+  pen::IMUData currentData;
+
+  std::cout << "\n[IDLE] Waiting for pen activity...\n";
+  writeMode("idle");
 
   while (true) {
-    std::cout << "\n[AI IDLE] Waiting for pen impact...\n";
-    writeMode("idle");
+    if (!backend.getLatestData(currentData))
+      continue;
 
-    // 1. WAKE-ON-IMPACT LOOP — total accel magnitude spike triggers recording
-    bool isWriting = false;
-    float prevMag = 0.0f;
-    while (!isWriting) {
-      if (backend.getLatestData(currentData)) {
-        float curMag = std::sqrt(currentData.ax * currentData.ax +
-                                 currentData.ay * currentData.ay +
-                                 currentData.az * currentData.az);
-        float shock  = std::abs(curMag - prevMag);
-        if (shock > WAKE_THRESHOLD_Z) {
-          std::cout << "[AI ACTIVE] Impact detected. Reading stroke...\n";
-          writeMode("Reading stroke...");
-          isWriting = true;
-        }
-        prevMag  = curMag;
-        prevData = currentData;
-      }
-    }
+    // ── Compute activity signals ──────────────────────────────────────────
+    float curAccelMag = std::sqrt(currentData.ax * currentData.ax +
+                                  currentData.ay * currentData.ay +
+                                  currentData.az * currentData.az);
+    float jerk = std::abs(curAccelMag - prevAccelMag) / DT; // g/s
+    float smoothJerk = JERK_SMOOTH * jerk + (1.0f - JERK_SMOOTH) * prevJerk;
+    prevJerk = smoothJerk;
+    prevAccelMag = curAccelMag;
 
-    // 2. CONTINUOUS WRITING LOOP — record raw 6-DOF sensor data
-    strokeBuffer.clear();
-    auto startTime = std::chrono::steady_clock::now();
-    long long lastActiveTime = 0;
+    float gyroMag = std::sqrt(currentData.gx * currentData.gx +
+                              currentData.gy * currentData.gy +
+                              currentData.gz * currentData.gz);
 
-    while (isWriting) {
-      if (backend.getLatestData(currentData)) {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             now - startTime)
-                             .count();
+    bool jerkActive = smoothJerk > JERK_IMPACT_THRESHOLD;
+    bool gyroActive = gyroMag > GYRO_ACTIVE_THRESHOLD;
+    bool isActive   = jerkActive || gyroActive;
 
-        // Activity from gyro magnitude + accel magnitude shock
-        float gyroMag = std::sqrt(currentData.gx * currentData.gx +
-                                  currentData.gy * currentData.gy +
-                                  currentData.gz * currentData.gz);
-        float curMag = std::sqrt(currentData.ax * currentData.ax +
-                                 currentData.ay * currentData.ay +
-                                 currentData.az * currentData.az);
-        float pMag   = std::sqrt(prevData.ax * prevData.ax +
-                                 prevData.ay * prevData.ay +
-                                 prevData.az * prevData.az);
-        float shock  = std::abs(curMag - pMag);
+    bool jerkQuiet = smoothJerk < JERK_QUIET_THRESHOLD;
+    bool gyroQuiet = gyroMag < GYRO_QUIET_THRESHOLD;
+    bool isQuiet   = jerkQuiet && gyroQuiet;
 
-        if (gyroMag > (ACTIVITY_THRESHOLD * 180.0f / M_PI) ||
-            shock > WAKE_THRESHOLD_Z) {
-          lastActiveTime = elapsedMs;
-        }
+    // ── State machine ─────────────────────────────────────────────────────
+    switch (penState) {
 
-        // Record raw sensor values — the ML model learns from these directly
+    case PenState::IDLE:
+      if (isActive) {
+        penState = PenState::WRITING;
+        quietFrames = 0;
+        strokeBuffer.clear();
+        std::cout << "[WRITING] Pen activity detected — recording...\n";
+        writeMode("Reading stroke...");
+        // Record the triggering frame
         strokeBuffer.push_back({currentData.ax, currentData.ay, currentData.az,
                                 currentData.gx, currentData.gy, currentData.gz});
-
-        // 3. IDLE TIMEOUT -> TRIGGER AI INFERENCE!
-        if ((elapsedMs - lastActiveTime) > IDLE_TIMEOUT_MS) {
-          std::cout << "[AI PROCESSING] Idle timeout reached. Analyzing "
-                    << strokeBuffer.size() << " frames...\n";
-          writeMode("Predicting...");
-          isWriting = false;
-        }
-
-        prevData = currentData;
       }
-    }
+      break;
 
-    // 4. FEED THE BRAIN
-    if (strokeBuffer.size() > 20 && session) {
-      runAIInference(*session, strokeBuffer);
+    case PenState::WRITING:
+      // Always record while in WRITING state
+      strokeBuffer.push_back({currentData.ax, currentData.ay, currentData.az,
+                              currentData.gx, currentData.gy, currentData.gz});
+
+      if (isQuiet) {
+        quietFrames++;
+        if (quietFrames > LIFT_QUIET_FRAMES) {
+          penState = PenState::LIFTED;
+          quietFrames = 0;
+          std::cout << "[LIFTED] Pen lifted — waiting for more writing or timeout...\n";
+          writeMode("Pen lifted...");
+        }
+      } else {
+        quietFrames = 0;
+      }
+      break;
+
+    case PenState::LIFTED:
+      // Still record frames in case the pen comes back down (captures the gap)
+      strokeBuffer.push_back({currentData.ax, currentData.ay, currentData.az,
+                              currentData.gx, currentData.gy, currentData.gz});
+
+      if (isActive) {
+        // Pen back on paper — resume writing
+        penState = PenState::WRITING;
+        quietFrames = 0;
+        std::cout << "[WRITING] Pen back on paper — continuing...\n";
+        writeMode("Reading stroke...");
+      } else {
+        quietFrames++;
+        if (quietFrames > IDLE_QUIET_FRAMES) {
+          // Extended silence — stroke is complete → run inference
+          penState = PenState::IDLE;
+          quietFrames = 0;
+
+          std::cout << "[PROCESSING] Stroke complete (" << strokeBuffer.size()
+                    << " frames). Running AI inference...\n";
+          writeMode("Predicting...");
+
+          if (strokeBuffer.size() > 20 && session) {
+            runAIInference(*session, strokeBuffer);
+          } else if (strokeBuffer.size() <= 20) {
+            std::cout << "[SKIPPED] Too few frames (" << strokeBuffer.size()
+                      << ") — likely accidental tap.\n";
+          }
+
+          strokeBuffer.clear();
+          std::cout << "\n[IDLE] Waiting for pen activity...\n";
+          writeMode("idle");
+        }
+      }
+      break;
     }
   }
   return 0;

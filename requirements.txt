@@ -12,3 +12,4 @@ onnx>=1.14.0
 # --- Optional (For Python testing) ---
 onnxruntime>=1.16.0
 onnxscript
+pyserial

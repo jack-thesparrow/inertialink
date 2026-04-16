@@ -89,7 +89,7 @@ cmake --build build
 source .venv/bin/activate
 
 # 4. Generate 2 400 synthetic training samples (200 × 12 words)
-python3 scripts/generate_synthetic_data.py
+python3 scripts/augment_seed_data.py
 
 # 5. Train (~10 min CPU, ~5 min GPU/XPU)
 python3 scripts/train_bilstm.py
@@ -205,7 +205,7 @@ high-quality synthetic samples:
 
 ```bash
 source .venv/bin/activate
-python3 scripts/generate_synthetic_data.py
+python3 scripts/augment_seed_data.py
 ```
 
 Creates `data/{word}/sample_001.csv … sample_200.csv` for all 12 trained words.
@@ -514,7 +514,7 @@ sudo usermod -aG video,render $USER
 ./docker/train_xpu.sh bash
 
 # Generate data inside container
-./docker/train_xpu.sh python3 scripts/generate_synthetic_data.py
+./docker/train_xpu.sh python3 scripts/augment_seed_data.py
 ```
 
 The container mounts the project root, so `data/` and `models/` are written to
@@ -540,7 +540,7 @@ inertialink/
 │   ├── tui_main.cpp        FTXUI terminal launcher
 │   └── visualizer_main.cpp
 ├── scripts/
-│   ├── generate_synthetic_data.py   2 400 labelled CSV samples
+│   ├── augment_seed_data.py   2 400 labelled CSV samples
 │   ├── train_bilstm.py              BiLSTM + CTC, XPU/CUDA/CPU
 │   ├── eval_model.py                Per-word accuracy report
 │   └── mock_esp32.py                UDP hardware simulator

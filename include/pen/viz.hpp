@@ -40,12 +40,14 @@ private:
 
   // Integrated gyro orientation (radians) — used for cube rotation
   float intPitch{0.0f}, intRoll{0.0f}, intYaw{0.0f};
-  // Raw GZ integration for canvas horizontal axis (no tilt compensation —
-  // calibration showed tilt comp causes 598% cross-axis bleed)
-  float intRawGZ{0.0f};
+  // Translation-gated canvas accumulators:
+  // Only accumulate when dynamic accel confirms pen tip is actually translating
+  // (not just rotating/tilting in place around a fixed tip).
+  float canvasGZ{0.0f};  // horizontal canvas position (from raw GZ, gated)
+  float canvasGY{0.0f};  // vertical canvas position (from raw GY, gated)
+  float translationGate{0.0f};  // smoothed 0..1 confidence of tip translation
   // Anchor values at stroke start — cube rotates relative to these
   float anchorPitch{0.0f}, anchorRoll{0.0f}, anchorYaw{0.0f};
-  float anchorRawGZ{0.0f};
 
   // ── Translation tracking (complementary filter + double integration) ──
   glm::vec3 gravity{0.0f, 0.0f, 1.0f};   // estimated gravity in sensor frame (g)

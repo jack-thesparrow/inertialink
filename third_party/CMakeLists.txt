@@ -13,13 +13,16 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
     GIT_TAG        3.3.8
+    GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(glfw)
 
 # --- GLM SETUP ---
+set(GLM_TEST_ENABLE OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(glm
     GIT_REPOSITORY https://github.com/g-truc/glm.git
     GIT_TAG       1.0.3
+    GIT_SHALLOW   TRUE
 )
 FetchContent_MakeAvailable(glm)
 
@@ -34,6 +37,7 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 
+message(STATUS "Downloading ONNX Runtime 1.17.1 (approx 100MB)... This may take a minute.")
 FetchContent_MakeAvailable(onnxruntime)
 
 # --- Auto-detect extracted directory ---
@@ -70,5 +74,7 @@ set(FTXUI_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(ftxui
     GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI
     GIT_TAG        v5.0.0
+    GIT_SHALLOW    TRUE
 )
+message(STATUS "Fetching FTXUI Terminal Library...")
 FetchContent_MakeAvailable(ftxui)

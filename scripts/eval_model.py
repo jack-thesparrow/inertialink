@@ -23,16 +23,13 @@ import onnxruntime as ort
 from datetime import datetime
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-ALPHABET      = "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+ALPHABET      = "~ 0123456789"
 MODEL_PATH    = "models/pen_model.onnx"
 DATA_DIR      = "data"
 RESULTS_PATH  = "models/eval_results.csv"
 SUMMARY_PATH  = "models/eval_summary.csv"
 
-ALL_WORDS = [
-    "hello", "world", "pen", "123", "write",
-    "note",  "data",  "code", "test", "abc", "xyz", "open",
-]
+ALL_WORDS = ["1", "2", "3"]
 
 
 # ── CTC helpers ───────────────────────────────────────────────────────────────
@@ -150,7 +147,7 @@ def main() -> None:
               f"({correct}/{n})  avg conf {avg_conf:.0f}%")
 
     if not word_stats:
-        print("[Error] No data found. Run generate_synthetic_data.py first.")
+        print("[Error] No data found. Run augment_seed_data.py first.")
         return
 
     # ── Totals ────────────────────────────────────────────────────────────────
