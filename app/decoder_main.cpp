@@ -68,15 +68,6 @@ static std::pair<std::string, bool> snapToVocab(const std::string &raw) {
   return {best, best != raw};
 }
 
-static std::vector<float> softmax(const float *logits, int64_t n) {
-  float max_val = *std::max_element(logits, logits + n);
-  std::vector<float> probs(n);
-  float sum = 0.0f;
-  for (int64_t i = 0; i < n; ++i) { probs[i] = std::exp(logits[i] - max_val); sum += probs[i]; }
-  for (auto &p : probs) p /= sum;
-  return probs;
-}
-
 // Numerically stable log(exp(a) + exp(b)).
 static constexpr float LOG_ZERO = -1e30f;
 static float log_sum_exp(float a, float b) {
@@ -101,17 +92,33 @@ static std::string ctc_beam_search(
     const float *logits_ptr, int64_t seq_len, int64_t num_classes,
     std::vector<std::pair<char, float>> &per_char_conf)
 {
+  // Single pass: pre-compute log-probs and track per-class peak probability.
+  // This eliminates repeated softmax calls inside the beam loop and the
+  // redundant O(seq_len * num_chars) softmax pass that was done afterwards.
+  std::vector<float> log_probs(seq_len * num_classes);
+  std::vector<float> class_peak(num_classes, 0.0f);
+
+  for (int64_t t = 0; t < seq_len; ++t) {
+    const float *frame = logits_ptr + t * num_classes;
+    float max_val = *std::max_element(frame, frame + num_classes);
+    float *lp = log_probs.data() + t * num_classes;
+    float sum = 0.0f;
+    for (int c = 0; c < num_classes; ++c) {
+      lp[c] = std::exp(frame[c] - max_val);
+      sum += lp[c];
+    }
+    for (int c = 0; c < num_classes; ++c) {
+      lp[c] /= sum; // probability
+      if (lp[c] > class_peak[c]) class_peak[c] = lp[c];
+      lp[c] = (lp[c] > 1e-30f) ? std::log(lp[c]) : LOG_ZERO;
+    }
+  }
+
   std::unordered_map<std::string, Beam> beams;
   beams[""].log_pb = 0.0f;
 
   for (int64_t t = 0; t < seq_len; ++t) {
-    const float *frame = logits_ptr + t * num_classes;
-    std::vector<float> lp(num_classes);
-    {
-      auto probs = softmax(frame, num_classes);
-      for (int c = 0; c < num_classes; ++c)
-        lp[c] = (probs[c] > 1e-30f) ? std::log(probs[c]) : LOG_ZERO;
-    }
+    const float *lp = log_probs.data() + t * num_classes;
 
     std::unordered_map<std::string, Beam> next;
     next.reserve(beams.size() * 4);
@@ -161,15 +168,11 @@ static std::string ctc_beam_search(
     if (b.log_total() > best_score) { best_score = b.log_total(); best_text = p; }
   }
 
+  // Confidence from pre-computed class peaks — no extra softmax pass needed.
   for (char ch : best_text) {
     auto pos = ALPHABET.find(ch);
     if (pos == std::string::npos) continue;
-    float peak = 0.0f;
-    for (int64_t t = 0; t < seq_len; ++t) {
-      auto probs = softmax(logits_ptr + t * num_classes, num_classes);
-      peak = std::max(peak, probs[static_cast<int>(pos)]);
-    }
-    per_char_conf.push_back({ch, peak});
+    per_char_conf.push_back({ch, class_peak[static_cast<int>(pos)]});
   }
 
   return best_text;
