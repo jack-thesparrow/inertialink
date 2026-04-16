@@ -63,10 +63,11 @@ __pycache__/
 *$py.class
 
 # Ignore generated ML datasets, caches, and model outputs
-data/
-models/
-*.pkl
-*.csv
+#data/
+#models/
+#*.pkl
+#*.csv
+*.pt
 
 # --- OS & Editor Junk ---
 .DS_Store
