@@ -23,7 +23,6 @@ jobs:
           python3 -m py_compile scripts/mock_esp32.py
           python3 -m py_compile scripts/train_bilstm.py
           python3 -m py_compile scripts/eval_model.py
-          python3 -m py_compile scripts/generate_synthetic_data.py
 
   # Slower job — installs full requirements and verifies every import resolves.
   imports:
