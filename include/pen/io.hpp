@@ -10,27 +10,30 @@ enum class ConnectionMode { None, USB, Bluetooth, WiFi };
 // Default port/address values and physics constants.
 // All app-layer code references these — nothing is hardcoded in the apps.
 // Keep leverArmMm / wakeThresholdZ / activityThreshold / idleTimeoutMs in sync
-// with generate_synthetic_data.py (IDLE_TIMEOUT_MS) and the ESP32 firmware.
+// with augment_seed_data.py (IDLE_TIMEOUT_MS) and the ESP32 firmware.
 struct Defaults {
   // Connection
   static constexpr const char *usbPort = "/dev/ttyUSB0";
   // Backward-compat alias for older app objects that still reference btPort.
-  static constexpr const char *btPort  = "/dev/rfcomm0";
+  static constexpr const char *btPort = "/dev/rfcomm0";
   // Decoder and visualizer listen on separate ports so both can run
   // simultaneously — SO_REUSEPORT load-balances (one receiver per packet),
   // two ports guarantee each process sees every packet independently.
-  static constexpr int wifiPort    = 5005;  // decoder
-  static constexpr int wifiVizPort = 5006;  // visualizer
+  static constexpr int wifiPort = 5005;    // decoder
+  static constexpr int wifiVizPort = 5006; // visualizer
 
   // Physics — distance (mm) from wrist pivot to pen tip used by both the
   // data collector and the ML decoder to project IMU angles onto 2-D canvas.
-  static constexpr float leverArmMm        = 150.0f;
+  static constexpr float leverArmMm = 150.0f;
   // Z-axis shock magnitude that wakes the system from idle.
-  static constexpr float wakeThresholdZ    = 0.5f;
+  static constexpr float wakeThresholdZ = 0.5f;
   // Minimum angular delta (radians) that counts as pen movement.
   static constexpr float activityThreshold = 0.02f;
   // Milliseconds of stillness before a stroke is considered complete.
-  static constexpr int   idleTimeoutMs     = 2000;
+  static constexpr int idleTimeoutMs = 700;
+  // Mounting tilt: angle (degrees) between pen shaft and the writing surface.
+  // Adjust to match your natural grip (most people 30-45°).
+  static constexpr float tiltAngleDeg = 45.0f;
 };
 
 struct IMUData {
@@ -80,9 +83,9 @@ public:
   void sendCommand(const std::string &cmd);
 
 private:
-  int  fd;
+  int fd;
   char buffer[256];
-  int  bufPos;
+  int bufPos;
 };
 
 // --- WI-FI UDP READER ---
@@ -95,7 +98,7 @@ public:
   bool readData(IMUData &data) override;
 
 private:
-  int  sockfd;
+  int sockfd;
   bool active;
 };
 
@@ -111,7 +114,8 @@ public:
   // connectUSB: opens the port and immediately sends "MODE:USB\n" so the
   // firmware starts streaming regardless of its current state.
   void connectUSB(const std::string &port = Defaults::usbPort);
-  // Backward-compat shim: Bluetooth transport is deprecated; this falls back to USB handling.
+  // Backward-compat shim: Bluetooth transport is deprecated; this falls back to
+  // USB handling.
   void connectBluetooth(const std::string &port = Defaults::btPort);
   void connectWiFi(int listenPort = Defaults::wifiPort);
   void disconnect();
@@ -120,15 +124,16 @@ public:
 
 private:
   std::unique_ptr<IMUReader> activeReader;
-  IMUFilter      filter;
-  ConnectionMode currentMode  = ConnectionMode::None;
-  std::string    currentStatus = "Disconnected";
+  IMUFilter filter;
+  ConnectionMode currentMode = ConnectionMode::None;
+  std::string currentStatus = "Disconnected";
 };
 
 namespace device {
 bool serialDeviceExists(const std::string &port);
 bool esp32DeviceFound(const std::string &preferredPort = Defaults::usbPort);
-std::string resolveEsp32Port(const std::string &preferredPort = Defaults::usbPort);
+std::string
+resolveEsp32Port(const std::string &preferredPort = Defaults::usbPort);
 } // namespace device
 
 } // namespace pen

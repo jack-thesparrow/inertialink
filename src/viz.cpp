@@ -4,10 +4,10 @@
 #include <glad/glad.h>
 // glad before GLFW
 #include <GLFW/glfw3.h>
+#include <cstdio>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <cstdio>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -58,7 +58,8 @@ void main() {
 Visualizer::Visualizer(int width, int height, const char *title) {
   if (!glfwInit()) {
     std::cerr << "[Viz] FATAL: glfwInit() failed.\n"
-              << "      Is a display server running? (check $DISPLAY / $WAYLAND_DISPLAY)\n";
+              << "      Is a display server running? (check $DISPLAY / "
+                 "$WAYLAND_DISPLAY)\n";
     exit(-1);
   }
 
@@ -75,7 +76,8 @@ Visualizer::Visualizer(int width, int height, const char *title) {
   }
   if (!window) {
     std::cerr << "[Viz] FATAL: glfwCreateWindow() failed.\n"
-              << "      OpenGL 3.3 Core Profile may not be supported by this driver.\n"
+              << "      OpenGL 3.3 Core Profile may not be supported by this "
+                 "driver.\n"
               << "      Try: glxinfo | grep 'OpenGL version'\n";
     glfwTerminate();
     exit(-1);
@@ -83,7 +85,8 @@ Visualizer::Visualizer(int width, int height, const char *title) {
 
   glfwMakeContextCurrent(window);
   if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-    std::cerr << "[Viz] FATAL: gladLoadGLLoader() failed — GL function pointers unavailable.\n";
+    std::cerr << "[Viz] FATAL: gladLoadGLLoader() failed — GL function "
+                 "pointers unavailable.\n";
     glfwTerminate();
     exit(-1);
   }
@@ -219,7 +222,8 @@ void Visualizer::drawCube(const IMUData &imu) {
   if (++frameCount % 60 == 0) {
     auto readTmpFile = [](const char *path, std::string &out) {
       std::FILE *f = std::fopen(path, "r");
-      if (!f) return;
+      if (!f)
+        return;
       char buf[64] = {};
       std::fgets(buf, sizeof(buf), f);
       std::fclose(f);
@@ -240,33 +244,254 @@ void Visualizer::drawCube(const IMUData &imu) {
     activeMode = mode;
   }
 
-  // ── New-stroke detection ──────────────────────────────────────────────────
-  // An az spike (same threshold as data_collector and decoder) signals
-  // pen-on-paper impact.  On detection: clear the canvas trail and reset the
-  // integrated orientation anchor so the cube shows rotation *relative to the
-  // grip at stroke start* rather than the absolute accumulated orientation.
-  if (prevIMUValid) {
-    float z_shock = std::abs(imu.az - prevIMU.az);
-    if (z_shock > pen::Defaults::wakeThresholdZ) {
+  // ── Constants ────────────────────────────────────────────────────────────
+  constexpr float DT = 0.01f; // 100 Hz
+  constexpr float DEG2RAD = static_cast<float>(M_PI / 180.0);
+  constexpr float G_MPS2 = 9.80665f; // m/s² per g
+
+  // ── Tilt compensation (cube rotation only) ──────────────────────────────
+  // Calibration showed tilt comp causes 598% cross-axis bleed on the 2D
+  // canvas, so it is ONLY used for the 3D cube rotation display.
+  // The canvas uses raw gyro axes (GZ=horizontal, GY=vertical) directly.
+  const float TILT_RAD = pen::Defaults::tiltAngleDeg * DEG2RAD;
+  const float cos_t = std::cos(TILT_RAD);
+  const float sin_t = std::sin(TILT_RAD);
+
+  float gx_comp = imu.gx * cos_t + imu.gz * sin_t;  // pitch (cube only)
+  float gz_comp = -imu.gx * sin_t + imu.gz * cos_t; // roll  (cube only)
+  float gy_comp = imu.gy;                           // yaw   (cube only)
+
+  // ── Gyro-aided complementary filter: estimate gravity (sensor frame) ──
+  // The old simple low-pass filter lagged behind during tilt changes,
+  // creating phantom "dynamic acceleration" from the shifting gravity
+  // projection.  This gyro-aided version predicts how gravity rotates
+  // using the gyroscope, so the estimate tracks tilt changes instantly.
+  // Only the long-term drift correction comes from the accelerometer.
+  constexpr float GRAV_ALPHA = 0.98f;
+
+  // Step 1: Predict gravity rotation using gyro (small-angle approx)
+  // dθ = gyro · dt  (radians per axis)
+  float wx = imu.gx * DT * DEG2RAD;
+  float wy = imu.gy * DT * DEG2RAD;
+  float wz = imu.gz * DT * DEG2RAD;
+
+  // Rotate the gravity estimate: g_pred = g + (ω × g)
+  // This makes the gravity vector follow orientation changes in real-time.
+  glm::vec3 g(gravity.x, gravity.y, gravity.z);
+  glm::vec3 omega(wx, wy, wz);
+  glm::vec3 g_rotated = g + glm::cross(omega, g);
+
+  // *** Normalize after rotation. ***
+  // The cross-product approximation inflates magnitude every frame:
+  //   |g + ω×g|² = |g|² + |ω×g|²  >  |g|²
+  // Without normalization, |gravity| drifts upward over time, creating a
+  // persistent bias in dynamic acceleration that opens the translation gate
+  // during pure tilt.  Re-normalizing to 1 g keeps the estimate honest.
+  float gRotMag = glm::length(g_rotated);
+  if (gRotMag > 0.01f)
+    g_rotated /= gRotMag;  // back to unit-g
+
+  // Step 2: Fuse gyro prediction with accelerometer measurement
+  gravity.x = GRAV_ALPHA * g_rotated.x + (1.0f - GRAV_ALPHA) * imu.ax;
+  gravity.y = GRAV_ALPHA * g_rotated.y + (1.0f - GRAV_ALPHA) * imu.ay;
+  gravity.z = GRAV_ALPHA * g_rotated.z + (1.0f - GRAV_ALPHA) * imu.az;
+
+  // Dynamic acceleration = raw minus gravity estimate (in m/s²)
+  float dyn_ax = (imu.ax - gravity.x) * G_MPS2;
+  float dyn_ay = (imu.ay - gravity.y) * G_MPS2;
+  float dyn_az = (imu.az - gravity.z) * G_MPS2;
+
+  // ── Pen activity detection ────────────────────────────────────────────────
+  // Two complementary signals:
+  //   1. Jerk  = rate of change of total accel magnitude (detects taps/impacts)
+  //   2. Gyro magnitude = angular velocity (detects pen rotation during writing)
+  // Either signal above its threshold → pen is WRITING.
+  float curAccelMag =
+      std::sqrt(imu.ax * imu.ax + imu.ay * imu.ay + imu.az * imu.az);
+  float jerk = std::abs(curAccelMag - prevAccelMag) / DT; // g/s
+  // Smooth jerk to avoid single-frame noise spikes
+  constexpr float JERK_SMOOTH = 0.3f;
+  float smoothJerk = JERK_SMOOTH * jerk + (1.0f - JERK_SMOOTH) * prevJerk;
+  prevJerk = smoothJerk;
+  prevAccelMag = curAccelMag;
+
+  // Gyroscope angular velocity magnitude (deg/s)
+  float gyroMag =
+      std::sqrt(imu.gx * imu.gx + imu.gy * imu.gy + imu.gz * imu.gz);
+
+  // Thresholds — tuned for normal handwriting on paper, not violent shaking.
+  // Jerk of ~5-15 g/s is typical during gentle pen strokes.
+  // Gyro of ~10-50 deg/s is typical wrist rotation while writing.
+  constexpr float JERK_IMPACT_THRESHOLD = 12.0f;  // g/s — pen touches paper
+  constexpr float JERK_QUIET_THRESHOLD = 2.0f;    // g/s — pen is still
+  constexpr float GYRO_ACTIVE_THRESHOLD = 15.0f;  // deg/s — pen is moving
+  constexpr float GYRO_QUIET_THRESHOLD = 5.0f;    // deg/s — pen is still
+  constexpr int LIFT_QUIET_FRAMES = 50;           // 500 ms of quiet = lifted
+
+  // Combined activity: pen is active if EITHER signal exceeds threshold
+  bool jerkActive = smoothJerk > JERK_IMPACT_THRESHOLD;
+  bool gyroActive = gyroMag > GYRO_ACTIVE_THRESHOLD;
+  bool isActive = jerkActive || gyroActive;
+
+  bool jerkQuiet = smoothJerk < JERK_QUIET_THRESHOLD;
+  bool gyroQuiet = gyroMag < GYRO_QUIET_THRESHOLD;
+  bool isQuiet = jerkQuiet && gyroQuiet;
+
+  switch (penState) {
+  case PenState::IDLE:
+    if (isActive) {
+      penState = PenState::WRITING;
+      quietFrames = 0;
+      // Reset stroke state for a new stroke
       strokeTrail.clear();
-      // Reset the integrated orientation anchor
-      intPitch = 0.0f; intRoll = 0.0f; intYaw = 0.0f;
-      anchorPitch = 0.0f; anchorRoll = 0.0f; anchorYaw = 0.0f;
+      intPitch = 0.0f;
+      intRoll = 0.0f;
+      intYaw = 0.0f;
+      canvasGZ = 0.0f;
+      canvasGY = 0.0f;
+      translationGate = 0.0f;
+      anchorPitch = 0.0f;
+      anchorRoll = 0.0f;
+      anchorYaw = 0.0f;
+      velocity = glm::vec3(0.0f);
+      position = glm::vec3(0.0f);
+      posAnchor = glm::vec3(0.0f);
+    }
+    break;
+
+  case PenState::WRITING:
+    if (isQuiet) {
+      quietFrames++;
+      if (quietFrames > LIFT_QUIET_FRAMES) {
+        penState = PenState::LIFTED;
+        quietFrames = 0;
+      }
+    } else {
+      quietFrames = 0;
+    }
+    break;
+
+  case PenState::LIFTED:
+    // Transition back to WRITING on any activity, or to IDLE after
+    // a longer period of silence.
+    if (isActive) {
+      penState = PenState::WRITING;
+      quietFrames = 0;
+    } else {
+      quietFrames++;
+      // After ~2 seconds of quiet after lift, go fully idle
+      if (quietFrames > 200) {
+        penState = PenState::IDLE;
+        quietFrames = 0;
+      }
+    }
+    break;
+  }
+
+  // ── Legacy new-stroke detection (shock-based reset) ───────────────────
+  // Keep as a fallback: a massive shock always resets the canvas.
+  if (prevIMUValid) {
+    float prevMag =
+        std::sqrt(prevIMU.ax * prevIMU.ax + prevIMU.ay * prevIMU.ay +
+                  prevIMU.az * prevIMU.az);
+    float shock = std::abs(curAccelMag - prevMag);
+    if (shock > pen::Defaults::wakeThresholdZ && penState == PenState::IDLE) {
+      strokeTrail.clear();
+      intPitch = 0.0f;
+      intRoll = 0.0f;
+      intYaw = 0.0f;
+      canvasGZ = 0.0f;
+      canvasGY = 0.0f;
+      translationGate = 0.0f;
+      anchorPitch = 0.0f;
+      anchorRoll = 0.0f;
+      anchorYaw = 0.0f;
+      velocity = glm::vec3(0.0f);
+      position = glm::vec3(0.0f);
+      posAnchor = glm::vec3(0.0f);
+      penState = PenState::WRITING;
     }
   } else {
-    intPitch = 0.0f; intRoll = 0.0f; intYaw = 0.0f;
-    anchorPitch = 0.0f; anchorRoll = 0.0f; anchorYaw = 0.0f;
+    intPitch = 0.0f;
+    intRoll = 0.0f;
+    intYaw = 0.0f;
+    canvasGZ = 0.0f;
+    canvasGY = 0.0f;
+    translationGate = 0.0f;
+    anchorPitch = 0.0f;
+    anchorRoll = 0.0f;
+    anchorYaw = 0.0f;
   }
-  prevIMU      = imu;
+  prevIMU = imu;
   prevIMUValid = true;
 
-  // Integrate gyroscope (deg/s) → accumulated orientation (radians)
-  constexpr float DT = 0.01f;  // 100 Hz
-  constexpr float DEG2RAD = static_cast<float>(M_PI / 180.0);
-  intPitch += imu.gx * DT * DEG2RAD;
-  intRoll  += imu.gy * DT * DEG2RAD;
-  intYaw   += imu.gz * DT * DEG2RAD;
+  // ── Integrate gyroscope (deg/s → radians) ────────────────────────────
+  // Tilt-compensated → cube rotation display (always accumulates)
+  intPitch += gx_comp * DT * DEG2RAD;
+  intYaw += gy_comp * DT * DEG2RAD;
+  intRoll += gz_comp * DT * DEG2RAD;
 
+  // ── Translation gate ─────────────────────────────────────────────────
+  // The canvas should ONLY advance when the pen tip is actually sliding
+  // across the paper (translation).  Pure rotation/tilt around a fixed
+  // tip must NOT produce stroke.
+  //
+  // Discriminator: dynamic acceleration (gravity already removed by the
+  // gyro-aided complementary filter above).  When the tip translates,
+  // the hand accelerates → produces dynamic accel.  When the tip is
+  // anchored and the pen just tilts, the gyro-aided gravity estimate
+  // tracks the tilt instantly → dynamic accel stays near zero.
+  //
+  // Additional guard: rotation-vs-translation ratio.  If the gyro
+  // magnitude is high but dynamic accel is low, the motion is purely
+  // rotational → explicitly suppress the gate regardless of noise.
+  constexpr float TRANS_ACCEL_THRESHOLD = 0.25f; // m/s² — min for tip movement
+  constexpr float GATE_ATTACK = 0.40f;  // how fast the gate opens (0→1)
+  constexpr float GATE_DECAY  = 0.92f;  // how slowly the gate closes
+  float dynMag = std::sqrt(dyn_ax * dyn_ax + dyn_ay * dyn_ay + dyn_az * dyn_az);
+
+  // ── Rotation-vs-translation discriminator (light safety net) ───────────
+  // With the gyro-aided + normalized gravity filter, dynMag is naturally
+  // near-zero (~0.06 m/s²) during anchored tilt, so the gate threshold
+  // alone suppresses most tilt.  This discriminator is just a safety net
+  // for fast rotation that might excite filter transients.
+  constexpr float ROTATION_ONLY_GYRO_MIN = 20.0f;   // deg/s — only obvious rotation
+  constexpr float ROTATION_ONLY_RATIO    = 0.015f;   // very conservative
+  bool pureRotation = (gyroMag > ROTATION_ONLY_GYRO_MIN) &&
+                      (dynMag / (gyroMag + 1e-6f) < ROTATION_ONLY_RATIO);
+
+  if (pureRotation) {
+    // Gently decay — don't slam, to avoid jerkiness
+    translationGate *= GATE_DECAY;
+  } else if (dynMag > TRANS_ACCEL_THRESHOLD && penState == PenState::WRITING) {
+    translationGate = translationGate * (1.0f - GATE_ATTACK) + GATE_ATTACK;
+  } else {
+    translationGate *= GATE_DECAY;
+  }
+  // Clamp to [0, 1]
+  if (translationGate < 0.01f) translationGate = 0.0f;
+  if (translationGate > 1.0f) translationGate = 1.0f;
+
+  // Canvas accumulators: raw gyro gated by translation confidence.
+  // When tip is anchored and pen tilts → translationGate ≈ 0 → no stroke.
+  // When tip slides across paper → translationGate ≈ 1 → full stroke.
+  canvasGZ += imu.gz * DT * DEG2RAD * translationGate;
+  canvasGY += imu.gy * DT * DEG2RAD * translationGate;
+
+  // ── Double-integrate dynamic acceleration for translation ────────────
+  constexpr float VEL_DECAY = 0.92f;
+  constexpr float ACCEL_GATE = 0.15f;
+
+  if (dynMag > ACCEL_GATE && penState == PenState::WRITING) {
+    velocity.x = velocity.x * VEL_DECAY + dyn_ax * DT;
+    velocity.y = velocity.y * VEL_DECAY + dyn_ay * DT;
+    velocity.z = velocity.z * VEL_DECAY + dyn_az * DT;
+  } else {
+    velocity *= VEL_DECAY * 0.8f;
+  }
+  position += velocity * DT;
+
+  // ── Viewport setup ──────────────────────────────────────────────────────
   int width, height;
   glfwGetFramebufferSize(window, &width, &height);
   int halfWidth = width / 2;
@@ -287,14 +512,14 @@ void Visualizer::drawCube(const IMUData &imu) {
 
   // Rotate by delta from the anchor set at stroke start, so the cube sits at
   // neutral when the pen first touches paper and shows only the writing motion.
-  float dYaw   = intYaw   - anchorYaw;
+  float dYaw = intYaw - anchorYaw;
   float dPitch = intPitch - anchorPitch;
-  float dRoll  = intRoll  - anchorRoll;
+  float dRoll = intRoll - anchorRoll;
 
   glm::mat4 cubeModel = glm::mat4(1.0f);
-  cubeModel = glm::rotate(cubeModel, dYaw,   glm::vec3(0.0f, 1.0f, 0.0f));
+  cubeModel = glm::rotate(cubeModel, dYaw, glm::vec3(0.0f, 1.0f, 0.0f));
   cubeModel = glm::rotate(cubeModel, dPitch, glm::vec3(1.0f, 0.0f, 0.0f));
-  cubeModel = glm::rotate(cubeModel, dRoll,  glm::vec3(0.0f, 0.0f, 1.0f));
+  cubeModel = glm::rotate(cubeModel, dRoll, glm::vec3(0.0f, 0.0f, 1.0f));
 
   glm::mat4 cubeMVP = projection * view * cubeModel;
 
@@ -314,47 +539,98 @@ void Visualizer::drawCube(const IMUData &imu) {
   // ==========================================
   glViewport(halfWidth, 0, halfWidth, height);
 
-  // Lever-arm projection using integrated gyro orientation — identical
-  // physics to data_collector and decoder.
-  //   x_mm = -yaw_rad   * leverArmMm
-  //   y_mm =  pitch_rad * leverArmMm
-  constexpr float MM_TO_GL = 1.0f / 200.0f;
-  glm::vec3 pt(
-      -intYaw   * pen::Defaults::leverArmMm * MM_TO_GL,
-       intPitch * pen::Defaults::leverArmMm * MM_TO_GL,
-      0.0f);
+  // ── Canvas position from calibrated raw gyro ─────────────────────────
+  // Calibration (5 cm square trace) revealed:
+  //   • Raw GZ reliably tracks HORIZONTAL movement (sign flips L↔R)
+  //   • Raw GY tracks VERTICAL movement (weaker, sign flips U↔D)
+  //   • Tilt compensation mixed GX into GZ → 598% cross-axis bleed
+  //   • Accel double-integration is mostly drift (same in all directions)
+  //
+  // Direct per-axis scale factors (radians → GL units):
+  //   Horizontal: 50 mm ≈ 0.108 rad of raw GZ → 5.5 GL/rad
+  //   Vertical:   50 mm ≈ 0.012 rad of raw GY → 25.0 GL/rad
+  constexpr float SCALE_HORIZ = 12.0f;  // GL units per radian (from GZ)
+  constexpr float SCALE_VERT  = 25.0f;  // GL units per radian (from GY)
+  constexpr float POS_TO_GL   = 6.0f;   // accel position scale (calibrated)
 
-  // Only accumulate trail while the pen is on paper.
-  // The az channel reads ~1.0 g at rest (gravity) and spikes on impact.
-  // When the pen is in the air, az magnitude drops near zero in synthetic
-  // data; for real hardware, use a threshold around the gravity baseline.
-  constexpr float PEN_CONTACT_MIN = 0.05f;
-  if (std::abs(imu.az) >= PEN_CONTACT_MIN) {
+  // Gyro component: raw axes, signs from calibration
+  //   rightward → GZ negative → negate for +X
+  //   upward    → GY negative → negate for +Y
+  float gyro_x = -canvasGZ * SCALE_HORIZ;
+  float gyro_y = -canvasGY * SCALE_VERT;
+
+  // Accel component: heavily reduced — calibration showed it's mostly drift.
+  float accel_x = -position.y * POS_TO_GL;
+  float accel_y = -position.x * POS_TO_GL;
+
+  // Blend: gyro dominates, accel just adds micro-impulse texture.
+  constexpr float GYRO_WEIGHT  = 0.95f;
+  constexpr float ACCEL_WEIGHT = 0.05f;
+
+  glm::vec3 pt(GYRO_WEIGHT * gyro_x + ACCEL_WEIGHT * accel_x,
+               GYRO_WEIGHT * gyro_y + ACCEL_WEIGHT * accel_y, 0.0f);
+
+  // Only accumulate trail while the pen is on paper (WRITING state).
+  if (penState == PenState::WRITING) {
     if (strokeTrail.empty()) {
       strokeAnchor = pt;
       strokeTrail.push_back(glm::vec3(0.0f));
     } else {
       glm::vec3 rel = pt - strokeAnchor;
-      if (glm::length(rel - strokeTrail.back()) > 0.002f) {
+      if (glm::length(rel - strokeTrail.back()) > 0.001f) {
         strokeTrail.push_back(rel);
-        if (strokeTrail.size() > 2000)
+        if (strokeTrail.size() > 4000)
           strokeTrail.erase(strokeTrail.begin());
       }
     }
   }
 
-  // Orthographic projection — correct for 2D; perspective would distort strokes.
-  // ±1.5 GL units covers ±150 mm of pen travel at current scale.
+  // ── Auto-scale: fit stroke bounding box to viewport ──────────────────
   float aspect = static_cast<float>(halfWidth) / static_cast<float>(height);
-  glm::mat4 ortho = glm::ortho(-1.5f * aspect,  1.5f * aspect,
-                                -1.5f,            1.5f,
-                                -1.0f,            1.0f);
+  float orthoHalfH = 1.5f; // default
+
+  if (strokeTrail.size() > 2) {
+    float minX = 1e9f, maxX = -1e9f;
+    float minY = 1e9f, maxY = -1e9f;
+    for (const auto &p : strokeTrail) {
+      if (p.x < minX)
+        minX = p.x;
+      if (p.x > maxX)
+        maxX = p.x;
+      if (p.y < minY)
+        minY = p.y;
+      if (p.y > maxY)
+        maxY = p.y;
+    }
+    float rangeX = maxX - minX;
+    float rangeY = maxY - minY;
+    float range = std::max(rangeX / aspect, rangeY);
+    // Add 30% padding, but enforce a minimum so tiny strokes don't get
+    // blown up to fill the entire screen.
+    orthoHalfH = std::max(range * 0.65f, 0.3f);
+  }
+
+  glm::mat4 ortho = glm::ortho(-orthoHalfH * aspect, orthoHalfH * aspect,
+                               -orthoHalfH, orthoHalfH, -1.0f, 1.0f);
+
+  // Center the view on the stroke midpoint
+  if (strokeTrail.size() > 2) {
+    float cx = 0.0f, cy = 0.0f;
+    for (const auto &p : strokeTrail) {
+      cx += p.x;
+      cy += p.y;
+    }
+    cx /= static_cast<float>(strokeTrail.size());
+    cy /= static_cast<float>(strokeTrail.size());
+    ortho = glm::translate(ortho, glm::vec3(-cx, -cy, 0.0f));
+  }
 
   glUseProgram(trailShaderProgram);
   glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"), 1,
                      GL_FALSE, glm::value_ptr(ortho));
   // Neon orange for the stroke trail
-  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"), 1.0f, 0.6f, 0.1f);
+  glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"), 1.0f, 0.6f,
+              0.1f);
 
   glBindVertexArray(trailVAO);
   glBindBuffer(GL_ARRAY_BUFFER, trailVBO);
@@ -364,11 +640,39 @@ void Visualizer::drawCube(const IMUData &imu) {
   glLineWidth(4.0f);
   glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(strokeTrail.size()));
 
+  // ── Pen state indicator ─────────────────────────────────────────────────
+  {
+    const char *stateStr = nullptr;
+    float cr = 1.0f, cg = 1.0f, cb = 1.0f;
+    switch (penState) {
+    case PenState::IDLE:
+      stateStr = "IDLE";
+      cr = 0.5f;
+      cg = 0.5f;
+      cb = 0.5f;
+      break;
+    case PenState::WRITING:
+      stateStr = "WRITING";
+      cr = 0.2f;
+      cg = 1.0f;
+      cb = 0.3f;
+      break;
+    case PenState::LIFTED:
+      stateStr = "LIFTED";
+      cr = 1.0f;
+      cg = 0.8f;
+      cb = 0.2f;
+      break;
+    }
+    if (stateStr)
+      renderText(stateStr, 8.0f, 8.0f, cr, cg, cb, halfWidth, height);
+  }
+
   // ── Word + mode HUD at the bottom of the canvas ─────────────────────────
   // Layout (y increases downward, y=0 = top of viewport):
   //   mode line  — above word, cyan (reading) or yellow (predicting)
   //   word line  — near bottom, white
-  constexpr float kS = 2.5f;   // label scale (stb units → screen px)
+  constexpr float kS = 2.5f; // label scale (stb units → screen px)
   if (!activeWord.empty()) {
     float wW = static_cast<float>(
         stb_easy_font_width(const_cast<char *>(activeWord.c_str())));
@@ -380,25 +684,26 @@ void Visualizer::drawCube(const IMUData &imu) {
     float mW = static_cast<float>(
         stb_easy_font_width(const_cast<char *>(activeMode.c_str())));
     float mtx = (halfWidth - mW * kS) * 0.5f;
-    float mty = height - kS * 12.0f * 2.5f - 8.0f;  // one line above word
+    float mty = height - kS * 12.0f * 2.5f - 8.0f; // one line above word
     bool predicting = (activeMode.rfind("Predict", 0) == 0);
-    float cr = predicting ? 1.0f : 0.2f;
-    float cg = predicting ? 0.9f : 1.0f;
-    float cb = predicting ? 0.2f : 0.4f;
-    renderText(activeMode, mtx, mty, cr, cg, cb, halfWidth, height);
+    float pcr = predicting ? 1.0f : 0.2f;
+    float pcg = predicting ? 0.9f : 1.0f;
+    float pcb = predicting ? 0.2f : 0.4f;
+    renderText(activeMode, mtx, mty, pcr, pcg, pcb, halfWidth, height);
   }
 }
 
 void Visualizer::renderText(const std::string &str, float tx, float ty,
-                            float cr, float cg, float cb,
-                            int vpWidth, int vpHeight) {
+                            float cr, float cg, float cb, int vpWidth,
+                            int vpHeight) {
   // stb_easy_font generates quads (4 verts × 16 bytes = 64 bytes/quad).
   // GL Core Profile removed GL_QUADS — convert each quad to two triangles.
   static char stbBuf[32 * 1024];
-  int numQuads = stb_easy_font_print(
-      0.0f, 0.0f, const_cast<char *>(str.c_str()),
-      nullptr, stbBuf, static_cast<int>(sizeof(stbBuf)));
-  if (numQuads <= 0) return;
+  int numQuads =
+      stb_easy_font_print(0.0f, 0.0f, const_cast<char *>(str.c_str()), nullptr,
+                          stbBuf, static_cast<int>(sizeof(stbBuf)));
+  if (numQuads <= 0)
+    return;
 
   std::vector<float> verts;
   verts.reserve(static_cast<std::size_t>(numQuads) * 6 * 3);
@@ -410,10 +715,16 @@ void Visualizer::renderText(const std::string &str, float tx, float ty,
       qy[v] = *reinterpret_cast<const float *>(stbBuf + base + v * 16 + 4);
     }
     auto push = [&](int i) {
-      verts.push_back(qx[i]); verts.push_back(qy[i]); verts.push_back(0.0f);
+      verts.push_back(qx[i]);
+      verts.push_back(qy[i]);
+      verts.push_back(0.0f);
     };
-    push(0); push(1); push(2);
-    push(0); push(2); push(3);
+    push(0);
+    push(1);
+    push(2);
+    push(0);
+    push(2);
+    push(3);
   }
 
   glBindVertexArray(textVAO);
@@ -425,16 +736,15 @@ void Visualizer::renderText(const std::string &str, float tx, float ty,
   // Pixel-space ortho (y down = stb convention).  Scale by kLabelScale so
   // characters are readable (~30 px tall) rather than the default ~12 px.
   constexpr float kLabelScale = 2.5f;
-  glm::mat4 proj  = glm::ortho(0.0f, static_cast<float>(vpWidth),
-                                static_cast<float>(vpHeight), 0.0f,
-                                -1.0f, 1.0f);
-  glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(tx, ty, 0.0f))
-                  * glm::scale(glm::mat4(1.0f),
-                               glm::vec3(kLabelScale, kLabelScale, 1.0f));
+  glm::mat4 proj = glm::ortho(0.0f, static_cast<float>(vpWidth),
+                              static_cast<float>(vpHeight), 0.0f, -1.0f, 1.0f);
+  glm::mat4 model =
+      glm::translate(glm::mat4(1.0f), glm::vec3(tx, ty, 0.0f)) *
+      glm::scale(glm::mat4(1.0f), glm::vec3(kLabelScale, kLabelScale, 1.0f));
 
   glUseProgram(trailShaderProgram);
-  glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"),
-                     1, GL_FALSE, glm::value_ptr(proj * model));
+  glUniformMatrix4fv(glGetUniformLocation(trailShaderProgram, "MVP"), 1,
+                     GL_FALSE, glm::value_ptr(proj * model));
   glUniform3f(glGetUniformLocation(trailShaderProgram, "uColor"), cr, cg, cb);
 
   glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size() / 3));

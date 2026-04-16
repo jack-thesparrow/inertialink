@@ -63,32 +63,33 @@ torch.set_float32_matmul_precision("high")
 # Fuse adjacent oneDNN ops (free ~5-10% on Intel CPUs)
 torch.jit.enable_onednn_fusion(True)
 
-# bfloat16 autocast: Intel 12th/13th gen CPUs run bf16 matmul natively.
-# Forward pass uses bf16; CTCLoss stays float32 (cast back before loss).
-# Falls back to float32 silently on CPUs that don't support it.
-USE_BF16 = (DEVICE.type == "cpu") and torch.cpu.is_available() and \
-           getattr(torch.backends, "mkldnn", None) is not None
+# Mixed precision (AMP): automatically uses fp16 for CUDA, bf16 for XPU/CPU.
+# Falls back to float32 silently on standard CPUs.
+USE_AMP = DEVICE.type in ["cuda", "xpu"]
+USE_BF16 = getattr(torch.backends, "mkldnn", None) is not None
+AMP_DTYPE = torch.float16 if DEVICE.type == "cuda" else torch.bfloat16
 
 # ---------------------------------------------------------
 # 1. ALPHABET & HYPERPARAMETERS
 # ---------------------------------------------------------
 # Index 0 is the CTC blank token (single placeholder char '~', never printed).
-# Real characters start at index 1.  Total classes = 64.
-ALPHABET = "~ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# ALPHABET for digits-only prototype (0 is CTC blank)
+ALPHABET = "~ 0123456789"
 CHAR_TO_IDX = {char: idx for idx, char in enumerate(ALPHABET)}
 IDX_TO_CHAR = {idx: char for idx, char in enumerate(ALPHABET)}
 
 INPUT_FEATURES = 6   # (ax, ay, az, gx, gy, gz)
-HIDDEN_SIZE    = 128  # Sufficient for 12-word synthetic vocab; ~4x faster than 256
-NUM_LAYERS     = 2    # 2 layers is enough; 3rd layer added marginal accuracy
-NUM_CLASSES    = len(ALPHABET)  # 64
+HIDDEN_SIZE    = 64  # Smaller vocabulary = can run an even smaller network
+NUM_LAYERS     = 2    
+NUM_CLASSES    = len(ALPHABET)  # 11
+CONV_CHANNELS  = 64   # Conv1d frontend output channels (feeds into LSTM)
 
-EPOCHS             = 300   # Cosine decays to ~1e-4 by epoch 200 (was too slow at 500)
-BATCH_SIZE         = 64   # 128 OOMs on Arc 530M (shared LPDDR5); use 32 if still OOM
-WARMUP_EPOCHS      = 20   # Linear LR warm-up before cosine decay
-BASE_LR            = 3e-4
-PATIENCE           = 150  # Must be > EPOCHS/2 so cosine has room to work
-CHECKPOINT_EVERY   = 2    # Save a resume checkpoint every N epochs
+EPOCHS             = 150   # Conv+BiLSTM converges faster; halved from 300
+BATCH_SIZE         = 128   # 2x larger batches = fewer steps/epoch
+WARMUP_EPOCHS      = 5     # Short warmup with higher base LR
+BASE_LR            = 5e-4  # Aggressive LR — cosine decays it safely
+PATIENCE           = 60    # Tighter early stop; conv frontend converges faster
+CHECKPOINT_EVERY   = 10    # Reduce checkpoint I/O overhead (was 2)
 CHECKPOINT_PATH    = "models/checkpoint.pt"
 LOG_PATH           = "models/training_log.csv"
 
@@ -97,170 +98,198 @@ LOG_PATH           = "models/training_log.csv"
 # 2. NEURAL NETWORK ARCHITECTURE
 # ---------------------------------------------------------
 class SmartPenDecoder(nn.Module):
-    """BiLSTM CTC decoder with baked-in z-score normalization.
+    """Conv1d + BiLSTM CTC decoder with baked-in z-score normalization.
 
-    Normalization stats are registered as buffers so they are part of the
-    ONNX export — the C++ decoder sends raw mm/accel values and gets
-    logits back without needing any preprocessing code on its side.
+    The Conv1d frontend (stride 2) halves the sequence length before the
+    LSTM, cutting LSTM compute by ~2x — the single biggest training speed
+    win.  Normalization stats are registered as buffers so they travel
+    into the ONNX export transparently.
     """
 
     def __init__(self, input_mean: torch.Tensor, input_std: torch.Tensor):
         super(SmartPenDecoder, self).__init__()
-        # Buffers travel with the model into ONNX; they are NOT trainable.
         self.register_buffer("input_mean", input_mean)
         self.register_buffer("input_std",  input_std)
 
+        # Conv frontend: (B, 6, T) → (B, 64, T//2)
+        # Halves sequence length, enriches features 6→64 for the LSTM.
+        self.conv = nn.Sequential(
+            nn.Conv1d(INPUT_FEATURES, CONV_CHANNELS,
+                      kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(CONV_CHANNELS),
+            nn.ReLU(),
+            nn.Dropout(0.15),
+        )
+
         self.lstm = nn.LSTM(
-            input_size=INPUT_FEATURES,
+            input_size=CONV_CHANNELS,
             hidden_size=HIDDEN_SIZE,
             num_layers=NUM_LAYERS,
             batch_first=True,
             bidirectional=True,
             dropout=0.3,
         )
-        # Bi-LSTM outputs 2x hidden size
         self.fc = nn.Linear(HIDDEN_SIZE * 2, NUM_CLASSES)
 
+    @staticmethod
+    def conv_out_len(length):
+        """Output length after stride-2 conv: (L-1)//2 + 1."""
+        return (length - 1) // 2 + 1
+
     def forward(self, x, lengths=None):
-        # x shape: (Batch, Seq_Len, Features) — raw values from C++
-        x = (x - self.input_mean) / (self.input_std + 1e-8)
+        # x: (B, T, 6) raw sensor values
+
+        x_accel = x[:, :, :3]
+        x_gyro  = x[:, :, 3:]
+
         if lengths is not None:
+            # Create mask for valid frames
+            mask = (torch.arange(x.size(1), device=x.device)[None, :] < lengths.to(x.device)[:, None]).float()
+            
+            # Local DC Offset Removal for Accelerometer (removes pen tilt/gravity)
+            # Sum only valid frames, then divide by the valid length
+            accel_sum = (x_accel * mask.unsqueeze(-1)).sum(dim=1)
+            local_accel_mean = accel_sum / lengths.to(x.device).float().unsqueeze(-1)
+            x_accel = x_accel - local_accel_mean.unsqueeze(1)
+            
+            # Gyroscope just uses the global mean (sensor bias)
+            x_gyro = x_gyro - self.input_mean[3:]
+            
+            x_centered = torch.cat([x_accel, x_gyro], dim=-1)
+            
+            # Zero out padding frames so they remain exactly 0.0
+            x_centered = x_centered * mask.unsqueeze(-1)
+        else:
+            # Inference mode (unpadded)
+            local_accel_mean = x_accel.mean(dim=1, keepdim=True)
+            x_accel = x_accel - local_accel_mean
+            x_gyro = x_gyro - self.input_mean[3:]
+            x_centered = torch.cat([x_accel, x_gyro], dim=-1)
+
+        # Apply global standard deviation
+        x = x_centered / (self.input_std + 1e-8)
+
+        # Conv1d wants (B, C, T)
+        x = self.conv(x.permute(0, 2, 1)).permute(0, 2, 1)  # → (B, T//2, 64)
+
+        if lengths is not None:
+            lengths = self.conv_out_len(lengths).clamp(min=1)
             packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
             packed_out, _ = self.lstm(packed)
             lstm_out, _ = pad_packed_sequence(packed_out, batch_first=True)
         else:
             lstm_out, _ = self.lstm(x)
         logits = self.fc(lstm_out)
-        # logits shape: (Batch, Seq_Len, Num_Classes)
         return logits
 
 
 DATASET_CACHE = "data/dataset_cache.pt"
 
+# Directories to scan for training data.  Both are merged into one dataset.
+#   data/       — augmented synthetic data from augment_seed_data.py
+#   data/seed/  — real hardware collected seed data from data_collector
+DATA_DIRS = ["data", "data/seed"]
+
 # ---------------------------------------------------------
 # 3. DATA LOADING
 # ---------------------------------------------------------
-def load_dataset(data_dir="data"):
+def _any_csv_newer_than(dirs: list[str], cache_path: str) -> bool:
+    """Return True if any CSV in `dirs` is newer than `cache_path`."""
+    if not os.path.exists(cache_path):
+        return True
+    cache_mtime = os.path.getmtime(cache_path)
+    for d in dirs:
+        if not os.path.exists(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.endswith(".csv") and os.path.getmtime(os.path.join(root, f)) > cache_mtime:
+                    return True
+    return False
+
+
+def load_dataset():
     """Load training tensors from cache or build from CSVs.
 
-    First run: reads all 2400 CSVs, converts to tensors, saves a single
-    dataset_cache.pt.  Every subsequent run loads that one file — startup
-    drops from ~10 s to < 1 s.
+    Scans both data/ (synthetic) and data_real/ (hardware-collected) and
+    merges every CSV into one dataset.  A single cache file is saved for
+    fast reloads.  The cache is automatically invalidated if any CSV is
+    newer than the cache file.
 
-    Delete data/dataset_cache.pt whenever you regenerate synthetic data so
-    the cache is rebuilt from the new CSVs.
+    Delete data/dataset_cache.pt manually if you want to force a rebuild.
     """
-    if os.path.exists(DATASET_CACHE):
+    if os.path.exists(DATASET_CACHE) and not _any_csv_newer_than(DATA_DIRS, DATASET_CACHE):
         print(f"[Dataset] Loading cache from {DATASET_CACHE} ...")
         cached = torch.load(DATASET_CACHE, map_location="cpu")
         return cached["X"], cached["Y"]
 
-    print("[Dataset] Cache not found — reading CSVs (first run only) ...")
-    if not os.path.exists(data_dir):
-        print(f"[Error] '{data_dir}' not found! Run generate_synthetic_data.py first.")
+    print("[Dataset] Building dataset from CSVs ...")
+    sequences, targets = [], []
+    source_counts: dict[str, int] = {}
+
+    for data_dir in DATA_DIRS:
+        if not os.path.exists(data_dir):
+            continue
+        for label_folder in sorted(os.listdir(data_dir)):
+            if data_dir == "data" and label_folder == "seed":
+                continue
+            folder_path = os.path.join(data_dir, label_folder)
+            if not os.path.isdir(folder_path):
+                continue
+            csv_files = glob.glob(f"{folder_path}/*.csv")
+            if not csv_files:
+                continue
+            for csv_file in csv_files:
+                df = pd.read_csv(csv_file)
+                sequences.append(
+                    torch.tensor(df[["ax", "ay", "az", "gx", "gy", "gz"]].values, dtype=torch.float32)
+                )
+                targets.append(
+                    torch.tensor(
+                        [CHAR_TO_IDX[c] for c in label_folder if c in CHAR_TO_IDX],
+                        dtype=torch.long,
+                    )
+                )
+            count = len(csv_files)
+            key = f"{data_dir}/{label_folder}"
+            source_counts[key] = count
+
+    if not sequences:
+        print("[Error] No training data found!  Run generate_synthetic_data.py or data_collector first.")
         return [], []
 
-    sequences, targets = [], []
-    for label_folder in sorted(os.listdir(data_dir)):
-        folder_path = os.path.join(data_dir, label_folder)
-        if not os.path.isdir(folder_path):
-            continue
-        csv_files = glob.glob(f"{folder_path}/*.csv")
-        if not csv_files:
-            continue
-        for csv_file in csv_files:
-            df = pd.read_csv(csv_file)
-            sequences.append(
-                torch.tensor(df[["ax", "ay", "az", "gx", "gy", "gz"]].values, dtype=torch.float32)
-            )
-            targets.append(
-                torch.tensor(
-                    [CHAR_TO_IDX[c] for c in label_folder if c in CHAR_TO_IDX],
-                    dtype=torch.long,
-                )
-            )
+    # Print source breakdown
+    for src, cnt in sorted(source_counts.items()):
+        tag = "seed" if "seed" in src else "aug "
+        print(f"  [{tag}] {src}: {cnt} samples")
 
+    os.makedirs(os.path.dirname(DATASET_CACHE), exist_ok=True)
     torch.save({"X": sequences, "Y": targets}, DATASET_CACHE)
-    print(f"[Dataset] Cached {len(sequences)} samples to {DATASET_CACHE}")
+    print(f"[Dataset] Cached {len(sequences)} total samples to {DATASET_CACHE}")
     return sequences, targets
 
 
 # ---------------------------------------------------------
-# 4. BATCH PRE-BUILDER
+# 4. GLOBAL BATCH PRE-BUILDER
 # ---------------------------------------------------------
-def build_batches(X_train, Y_train, indices, batch_size):
-    """Pre-assemble all padded batches for one epoch.
-
-    Runs once in Python before each epoch so there is zero Python
-    overhead *between* GPU kernel launches during the actual training
-    loop — the GPU gets a new pre-built tensor immediately after each
-    optimizer step.
-
-    Mini-bucket sorting: within each window of 4×batch_size samples we
-    sort by sequence length.  This keeps similar-length sequences together
-    so each padded batch is only as long as its longest member rather than
-    the global maximum — typically cuts padding by ~25 %, reducing wasted
-    LSTM compute without removing the per-epoch shuffle randomness.
+def prep_global_tensors(X_train, Y_train, device):
+    """Pad the entire dataset to a single fixed tensor up-front.
+    Eliminates PyTorch padding overhead during training and locks the
+    batch sequence length so torch.compile only compiles exactly once.
     """
-    bucket = batch_size * 4
-    sorted_indices: list[int] = []
-    for start in range(0, len(indices), bucket):
-        chunk = indices[start : start + bucket]
-        chunk.sort(key=lambda i: X_train[i].size(0))
-        sorted_indices.extend(chunk)
-
-    batches = []
-    for start in range(0, len(sorted_indices), batch_size):
-        idx = sorted_indices[start : start + batch_size]
-        xs  = [X_train[i] for i in idx]
-        ys  = [Y_train[i] for i in idx]
-        lengths        = torch.tensor([x.size(0) for x in xs], dtype=torch.long)
-        x_pad          = pad_sequence(xs, batch_first=True)        # on DEVICE already
-        targets        = torch.cat(ys)                              # CPU
-        target_lengths = torch.tensor([y.size(0) for y in ys], dtype=torch.long)
-        batches.append((x_pad, lengths, targets, target_lengths))
-    return batches
-
-
-class EpochPrefetcher:
-    """Persistent background thread that keeps one pre-built epoch ready.
-
-    Replaces the per-epoch Thread create/join pattern.  A single daemon
-    thread runs forever, builds the next epoch's batches into a Queue,
-    and blocks until the training loop consumes them.  The main thread
-    calls .next() which returns immediately if prefetch finished during
-    training, or waits the remaining time if training was unusually fast.
-
-    Eliminates the CPU dip at epoch boundaries caused by thread teardown,
-    GIL contention during Thread.__init__, and join() wait.
-    """
-
-    def __init__(self, X_train, Y_train, batch_size: int):
-        self._X          = X_train
-        self._Y          = Y_train
-        self._batch_size = batch_size
-        self._queue: "queue.Queue[tuple]" = queue.Queue(maxsize=1)
-        self._stop       = threading.Event()
-        self._thread     = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        indices = list(range(len(self._X)))
-        while not self._stop.is_set():
-            random.shuffle(indices)
-            batches = build_batches(self._X, self._Y, indices, self._batch_size)
-            # put() blocks if the queue already holds one epoch (training hasn't
-            # consumed the previous result yet) — no busy-wait, no wasted CPU.
-            self._queue.put((indices[:], batches))
-
-    def next(self) -> tuple:
-        """Return (indices, batches) for the next epoch.  Blocks only if the
-        worker hasn't finished building yet (training was faster than prefetch).
-        """
-        return self._queue.get()
-
-    def stop(self):
-        self._stop.set()
+    print("[Dataset] Padding entire dataset globally...")
+    xs = [x.to(device) for x in X_train]
+    X_pad = pad_sequence(xs, batch_first=True)  # (N, T_max, 6)
+    
+    lengths_t = torch.tensor([x.size(0) for x in X_train], dtype=torch.long)
+    targets_flat = torch.cat(Y_train)
+    tgt_lengths_t = torch.tensor([y.size(0) for y in Y_train], dtype=torch.long)
+    
+    # Pre-calculate slice indices for the flattened targets
+    target_start_idx = torch.zeros(len(Y_train) + 1, dtype=torch.long)
+    target_start_idx[1:] = tgt_lengths_t.cumsum(dim=0)
+    
+    return X_pad, lengths_t, targets_flat, tgt_lengths_t, target_start_idx
 
 
 # ---------------------------------------------------------
@@ -366,11 +395,9 @@ def train_and_export():
     print(f"Training for {EPOCHS} epochs, batch size {BATCH_SIZE}.")
     print("-" * 60)
 
-    # Pre-move all training tensors to the device once at startup.
-    # This eliminates per-batch CPU→GPU transfers that stall the GPU.
-    X_train = [x.to(DEVICE) for x in X_train]
-    # Targets stay on CPU — CTCLoss backward requires CPU target indices.
-    # We only transfer the padded input and lengths to the device.
+    # Pad the entire dataset upfront globally. 
+    # This locks sequence lengths to T_max and speeds up torch.compile massively.
+    X_pad_global, lengths_global, targets_global, tgt_lengths_global, tgt_starts_global = prep_global_tensors(X_train, Y_train, DEVICE)
 
     indices        = list(range(n))
     best_loss      = float("inf")
@@ -394,14 +421,17 @@ def train_and_export():
             return {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
                     for k, v in sd.items()}
 
-        model.load_state_dict(_clean(ckpt["model"]))
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch  = ckpt["epoch"] + 1
-        best_loss    = ckpt["best_loss"]
-        no_improve   = ckpt["no_improve"]
-        bw = ckpt.get("best_weights")
-        best_weights = _clean(bw) if bw is not None else None
-        print(f"[Checkpoint] Resuming at epoch {start_epoch}, best loss {best_loss:.4f}")
+        try:
+            model.load_state_dict(_clean(ckpt["model"]))
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_epoch  = ckpt["epoch"] + 1
+            best_loss    = ckpt["best_loss"]
+            no_improve   = ckpt["no_improve"]
+            bw = ckpt.get("best_weights")
+            best_weights = _clean(bw) if bw is not None else None
+            print(f"[Checkpoint] Resuming at epoch {start_epoch}, best loss {best_loss:.4f}")
+        except RuntimeError:
+            print("[Checkpoint] Architecture changed — starting fresh training")
 
     # Write SESSION START (also detects previous kill and notes it in the log)
     _log_session_start(start_epoch)
@@ -414,11 +444,9 @@ def train_and_export():
     # torch.compile() AFTER checkpoint load — compiling changes key names
     # (_orig_mod. prefix) so the checkpoint must be loaded into the raw model first.
     try:
-        # max-autotune: profiles multiple kernel implementations and keeps the
-        # fastest one — best for repeated fixed-shape workloads (our batches).
-        # First epoch is slower while it benchmarks; every subsequent epoch wins.
-        model = torch.compile(model, mode="max-autotune")
-        print("torch.compile: enabled (max-autotune, faster after 1st epoch)")
+        # dynamic=True prevents recompilation stalls when pack_padded_sequence is used
+        model = torch.compile(model, dynamic=True)
+        print("torch.compile: enabled (dynamic=True)")
     except Exception:
         print("torch.compile: not available, running normally")
 
@@ -428,15 +456,8 @@ def train_and_export():
     accel.append("oneDNN-fusion")
     accel.append("bf16" if USE_BF16 else "fp32")
     accel.append("foreach-adam")
-    accel.append("persistent-prefetch")
-    accel.append("bucket-batching")
+    accel.append("global-memory-slice")
     print(f"Acceleration: {' | '.join(accel)}")
-
-    # Persistent prefetch worker — one thread lives for the whole training run.
-    # It builds the next epoch's batches into a queue while the current epoch
-    # trains, then blocks until training consumes the result.  No per-epoch
-    # thread create/join overhead → smoother CPU utilisation across epochs.
-    prefetcher = EpochPrefetcher(X_train, Y_train, BATCH_SIZE)
 
     model.train()
     try:
@@ -446,40 +467,52 @@ def train_and_export():
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            # Grab the pre-built batches for this epoch (returns immediately
-            # if the worker finished during last epoch, else waits the diff).
-            indices, batches = prefetcher.next()
-            n_batches   = len(batches)
+            # Slice batches directly from pre-padded memory
+            random.shuffle(indices)
+            n_batches = (n + BATCH_SIZE - 1) // BATCH_SIZE
             batch_count = 0
             total_loss  = 0.0
 
-            for x_pad, lengths, targets, target_lengths in batches:
-                # set_to_none=True: skips the memset that zero_grad() does —
-                # None gradients are treated as zero by the backward pass but
-                # avoid touching memory unnecessarily (small but free speedup).
+            for start_idx in range(0, n, BATCH_SIZE):
+                batch_idx = indices[start_idx : start_idx + BATCH_SIZE]
+                
+                # Slicing from global tensors
+                x_pad = X_pad_global[batch_idx]
+                lengths = lengths_global[batch_idx]
+                target_lengths = tgt_lengths_global[batch_idx]
+                
+                # Gather targets dynamically from the flat array using start offsets
+                ys = []
+                for idx in batch_idx:
+                    s = tgt_starts_global[idx]
+                    e = s + tgt_lengths_global[idx]
+                    ys.append(targets_global[s:e])
+                targets = torch.cat(ys)
+
                 optimizer.zero_grad(set_to_none=True)
 
-                # bf16 autocast: faster matmul on Intel 12th/13th gen CPUs.
-                # CTCLoss needs float32 so we cast logits back before loss.
                 with torch.autocast(device_type=DEVICE.type,
-                                    dtype=torch.bfloat16,
-                                    enabled=USE_BF16):
+                                    dtype=AMP_DTYPE,
+                                    enabled=USE_AMP or USE_BF16):
                     logits = model(x_pad, lengths)           # (B, T_max, C)
 
-                logits_ctc = logits.float().permute(1, 0, 2) # (T_max, B, C) fp32
+                logits_ctc = logits.float().permute(1, 0, 2) # (T_out, B, C) fp32
+
+                # Conv stride-2 halves T; CTC needs the actual output lengths
+                ctc_lengths = SmartPenDecoder.conv_out_len(lengths).clamp(min=1)
 
                 if _ctc_native:
                     loss = ctc_loss(
                         logits_ctc.log_softmax(2),
                         targets.to(DEVICE),
-                        lengths.to(DEVICE),
+                        ctc_lengths.to(DEVICE),
                         target_lengths.to(DEVICE),
                     )
                 else:
                     loss = ctc_loss(
                         logits_ctc.cpu().log_softmax(2),
                         targets,
-                        lengths,
+                        ctc_lengths,
                         target_lengths,
                     )
 
@@ -490,14 +523,15 @@ def train_and_export():
                 total_loss  += loss.item() * x_pad.size(0)
                 batch_count += 1
 
-                filled = int(bar_width * batch_count / n_batches)
-                bar    = "#" * filled + "-" * (bar_width - filled)
-                sys.stdout.write(
-                    f"\rEpoch {epoch+1:>4}/{EPOCHS}  [{bar}]  "
-                    f"batch {batch_count}/{n_batches}  "
-                    f"lr={lr:.2e}"
-                )
-                sys.stdout.flush()
+                if batch_count % 10 == 0 or batch_count == n_batches:
+                    filled = int(bar_width * batch_count / n_batches)
+                    bar    = "#" * filled + "-" * (bar_width - filled)
+                    sys.stdout.write(
+                        f"\rEpoch {epoch+1:>4}/{EPOCHS}  [{bar}]  "
+                        f"batch {batch_count}/{n_batches}  "
+                        f"lr={lr:.2e}"
+                    )
+                    sys.stdout.flush()
 
             avg_loss = total_loss / n
             if avg_loss < best_loss:
@@ -559,13 +593,12 @@ def train_and_export():
         if best_weights is None:
             print("No epoch completed — nothing to export. Re-run and let at least 1 epoch finish.")
             _log_session_end("ctrl+c (no weights)", float("inf"), start_epoch)
-            prefetcher.stop()
             return
         _log_session_end(f"ctrl+c", best_loss, epoch + 1)
         print(f"Exporting model at best loss {best_loss:.4f} (checkpoint kept — re-run to continue training) ...")
 
     finally:
-        prefetcher.stop()
+        pass
 
     # Restore the best weights seen during training.
     # best_weights is always saved from raw_model so keys are clean — load directly.
@@ -601,8 +634,8 @@ def train_and_export():
         input_names=["input_stroke"],
         output_names=["predicted_logits"],
         dynamic_axes={
-            "input_stroke":     {1: "seq_len"},
-            "predicted_logits": {1: "seq_len"},
+            "input_stroke":     {1: "input_seq_len"},
+            "predicted_logits": {1: "output_seq_len"},
         },
     )
 

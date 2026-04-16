@@ -5,7 +5,7 @@
 # Usage:
 #   ./docker/train_xpu.sh                  # train (default)
 #   ./docker/train_xpu.sh bash             # interactive shell
-#   ./docker/train_xpu.sh python scripts/generate_synthetic_data.py
+#   ./docker/train_xpu.sh python scripts/augment_seed_data.py
 #
 # First-time host setup (run once, then log out/in):
 #   sudo usermod -aG video,render $USER
