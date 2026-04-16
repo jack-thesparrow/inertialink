@@ -255,7 +255,7 @@ def load_dataset():
             source_counts[key] = count
 
     if not sequences:
-        print("[Error] No training data found!  Run generate_synthetic_data.py or data_collector first.")
+        print("[Error] No training data found!  Collect data using ./bin/data_collector first")
         return [], []
 
     # Print source breakdown
