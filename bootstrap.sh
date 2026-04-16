@@ -105,19 +105,16 @@ fi
 
 # --- 5. INSTALL PLATFORMIO UDEV RULES ---
 echo ""
-echo "[+] Installing PlatformIO UDEV Rules (Fixes USB flashing issues)..."
-if [ ! -f "/etc/udev/rules.d/99-platformio-udev.rules" ]; then
-  curl -fsSL https://raw.githubusercontent.com/platformio/platformio-core/master/scripts/99-platformio-udev.rules | sudo tee /etc/udev/rules.d/99-platformio-udev.rules >/dev/null
-  sudo udevadm control --reload-rules
-  sudo udevadm trigger
-  echo "    Rules installed and udev reloaded."
-else
-  echo "    UDEV rules already installed."
-fi
+echo "[+] Installing/Updating PlatformIO UDEV Rules (Fixes USB flashing issues)..."
+curl -fsSL https://raw.githubusercontent.com/platformio/platformio-core/develop/platformio/assets/system/99-platformio-udev.rules | sudo tee /etc/udev/rules.d/99-platformio-udev.rules >/dev/null
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+echo "    Rules updated and udev reloaded."
 
 # --- 6. CONFIGURE CMAKE ---
 echo ""
 echo "[+] Configuring CMake build system..."
+rm -rf build/CMakeCache.txt build/CMakeFiles
 cmake -B build -G Ninja
 echo "    Build configured. Run: cmake --build build"
 

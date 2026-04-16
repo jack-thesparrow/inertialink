@@ -26,5 +26,5 @@ COPY . .
 
 # Default command: run the training script.
 # Override at runtime, e.g.:
-#   docker run ... inertialink-xpu python scripts/generate_synthetic_data.py
+#   docker run ... inertialink-xpu python scripts/augment_seed_data.py
 CMD ["python", "scripts/train_bilstm.py"]

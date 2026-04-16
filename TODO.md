@@ -6,7 +6,7 @@ Goal: user writes with the IMU pen → real-time soft copy generated, no OCR, no
 
 ## Phase 1 — Character-Level Training Data
 
-- [ ] Extend `generate_synthetic_data.py` with stroke paths for all 62 characters
+- [ ] Extend `augment_seed_data.py` logic to rotate/warp generic seed data effectively
   - [ ] a–z (26 lowercase)
   - [ ] A–Z (26 uppercase)
   - [ ] 0–9 (10 digits)

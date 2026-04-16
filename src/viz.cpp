@@ -261,11 +261,40 @@ void Visualizer::drawCube(const IMUData &imu) {
   float gz_comp = -imu.gx * sin_t + imu.gz * cos_t; // roll  (cube only)
   float gy_comp = imu.gy;                           // yaw   (cube only)
 
-  // ── Complementary filter: estimate gravity (raw sensor frame) ────────
+  // ── Gyro-aided complementary filter: estimate gravity (sensor frame) ──
+  // The old simple low-pass filter lagged behind during tilt changes,
+  // creating phantom "dynamic acceleration" from the shifting gravity
+  // projection.  This gyro-aided version predicts how gravity rotates
+  // using the gyroscope, so the estimate tracks tilt changes instantly.
+  // Only the long-term drift correction comes from the accelerometer.
   constexpr float GRAV_ALPHA = 0.98f;
-  gravity.x = GRAV_ALPHA * gravity.x + (1.0f - GRAV_ALPHA) * imu.ax;
-  gravity.y = GRAV_ALPHA * gravity.y + (1.0f - GRAV_ALPHA) * imu.ay;
-  gravity.z = GRAV_ALPHA * gravity.z + (1.0f - GRAV_ALPHA) * imu.az;
+
+  // Step 1: Predict gravity rotation using gyro (small-angle approx)
+  // dθ = gyro · dt  (radians per axis)
+  float wx = imu.gx * DT * DEG2RAD;
+  float wy = imu.gy * DT * DEG2RAD;
+  float wz = imu.gz * DT * DEG2RAD;
+
+  // Rotate the gravity estimate: g_pred = g + (ω × g)
+  // This makes the gravity vector follow orientation changes in real-time.
+  glm::vec3 g(gravity.x, gravity.y, gravity.z);
+  glm::vec3 omega(wx, wy, wz);
+  glm::vec3 g_rotated = g + glm::cross(omega, g);
+
+  // *** Normalize after rotation. ***
+  // The cross-product approximation inflates magnitude every frame:
+  //   |g + ω×g|² = |g|² + |ω×g|²  >  |g|²
+  // Without normalization, |gravity| drifts upward over time, creating a
+  // persistent bias in dynamic acceleration that opens the translation gate
+  // during pure tilt.  Re-normalizing to 1 g keeps the estimate honest.
+  float gRotMag = glm::length(g_rotated);
+  if (gRotMag > 0.01f)
+    g_rotated /= gRotMag;  // back to unit-g
+
+  // Step 2: Fuse gyro prediction with accelerometer measurement
+  gravity.x = GRAV_ALPHA * g_rotated.x + (1.0f - GRAV_ALPHA) * imu.ax;
+  gravity.y = GRAV_ALPHA * g_rotated.y + (1.0f - GRAV_ALPHA) * imu.ay;
+  gravity.z = GRAV_ALPHA * g_rotated.z + (1.0f - GRAV_ALPHA) * imu.az;
 
   // Dynamic acceleration = raw minus gravity estimate (in m/s²)
   float dyn_ax = (imu.ax - gravity.x) * G_MPS2;
@@ -318,11 +347,12 @@ void Visualizer::drawCube(const IMUData &imu) {
       intPitch = 0.0f;
       intRoll = 0.0f;
       intYaw = 0.0f;
-      intRawGZ = 0.0f;
+      canvasGZ = 0.0f;
+      canvasGY = 0.0f;
+      translationGate = 0.0f;
       anchorPitch = 0.0f;
       anchorRoll = 0.0f;
       anchorYaw = 0.0f;
-      anchorRawGZ = 0.0f;
       velocity = glm::vec3(0.0f);
       position = glm::vec3(0.0f);
       posAnchor = glm::vec3(0.0f);
@@ -370,11 +400,12 @@ void Visualizer::drawCube(const IMUData &imu) {
       intPitch = 0.0f;
       intRoll = 0.0f;
       intYaw = 0.0f;
-      intRawGZ = 0.0f;
+      canvasGZ = 0.0f;
+      canvasGY = 0.0f;
+      translationGate = 0.0f;
       anchorPitch = 0.0f;
       anchorRoll = 0.0f;
       anchorYaw = 0.0f;
-      anchorRawGZ = 0.0f;
       velocity = glm::vec3(0.0f);
       position = glm::vec3(0.0f);
       posAnchor = glm::vec3(0.0f);
@@ -384,36 +415,79 @@ void Visualizer::drawCube(const IMUData &imu) {
     intPitch = 0.0f;
     intRoll = 0.0f;
     intYaw = 0.0f;
-    intRawGZ = 0.0f;
+    canvasGZ = 0.0f;
+    canvasGY = 0.0f;
+    translationGate = 0.0f;
     anchorPitch = 0.0f;
     anchorRoll = 0.0f;
     anchorYaw = 0.0f;
-    anchorRawGZ = 0.0f;
   }
   prevIMU = imu;
   prevIMUValid = true;
 
   // ── Integrate gyroscope (deg/s → radians) ────────────────────────────
-  // Tilt-compensated → cube rotation display
+  // Tilt-compensated → cube rotation display (always accumulates)
   intPitch += gx_comp * DT * DEG2RAD;
   intYaw += gy_comp * DT * DEG2RAD;
   intRoll += gz_comp * DT * DEG2RAD;
-  // Raw GZ → canvas horizontal axis (calibration: GZ is the true horizontal signal)
-  intRawGZ += imu.gz * DT * DEG2RAD;
+
+  // ── Translation gate ─────────────────────────────────────────────────
+  // The canvas should ONLY advance when the pen tip is actually sliding
+  // across the paper (translation).  Pure rotation/tilt around a fixed
+  // tip must NOT produce stroke.
+  //
+  // Discriminator: dynamic acceleration (gravity already removed by the
+  // gyro-aided complementary filter above).  When the tip translates,
+  // the hand accelerates → produces dynamic accel.  When the tip is
+  // anchored and the pen just tilts, the gyro-aided gravity estimate
+  // tracks the tilt instantly → dynamic accel stays near zero.
+  //
+  // Additional guard: rotation-vs-translation ratio.  If the gyro
+  // magnitude is high but dynamic accel is low, the motion is purely
+  // rotational → explicitly suppress the gate regardless of noise.
+  constexpr float TRANS_ACCEL_THRESHOLD = 0.25f; // m/s² — min for tip movement
+  constexpr float GATE_ATTACK = 0.40f;  // how fast the gate opens (0→1)
+  constexpr float GATE_DECAY  = 0.92f;  // how slowly the gate closes
+  float dynMag = std::sqrt(dyn_ax * dyn_ax + dyn_ay * dyn_ay + dyn_az * dyn_az);
+
+  // ── Rotation-vs-translation discriminator (light safety net) ───────────
+  // With the gyro-aided + normalized gravity filter, dynMag is naturally
+  // near-zero (~0.06 m/s²) during anchored tilt, so the gate threshold
+  // alone suppresses most tilt.  This discriminator is just a safety net
+  // for fast rotation that might excite filter transients.
+  constexpr float ROTATION_ONLY_GYRO_MIN = 20.0f;   // deg/s — only obvious rotation
+  constexpr float ROTATION_ONLY_RATIO    = 0.015f;   // very conservative
+  bool pureRotation = (gyroMag > ROTATION_ONLY_GYRO_MIN) &&
+                      (dynMag / (gyroMag + 1e-6f) < ROTATION_ONLY_RATIO);
+
+  if (pureRotation) {
+    // Gently decay — don't slam, to avoid jerkiness
+    translationGate *= GATE_DECAY;
+  } else if (dynMag > TRANS_ACCEL_THRESHOLD && penState == PenState::WRITING) {
+    translationGate = translationGate * (1.0f - GATE_ATTACK) + GATE_ATTACK;
+  } else {
+    translationGate *= GATE_DECAY;
+  }
+  // Clamp to [0, 1]
+  if (translationGate < 0.01f) translationGate = 0.0f;
+  if (translationGate > 1.0f) translationGate = 1.0f;
+
+  // Canvas accumulators: raw gyro gated by translation confidence.
+  // When tip is anchored and pen tilts → translationGate ≈ 0 → no stroke.
+  // When tip slides across paper → translationGate ≈ 1 → full stroke.
+  canvasGZ += imu.gz * DT * DEG2RAD * translationGate;
+  canvasGY += imu.gy * DT * DEG2RAD * translationGate;
 
   // ── Double-integrate dynamic acceleration for translation ────────────
-  // Heavy velocity decay prevents unbounded drift.  The position tracks
-  // short bursts of lateral hand movement that the gyro alone can't see.
-  constexpr float VEL_DECAY = 0.92f;  // per-frame multiplier (< 1 = decay)
-  constexpr float ACCEL_GATE = 0.15f; // m/s² — dead zone to reject noise
-  float dynMag = std::sqrt(dyn_ax * dyn_ax + dyn_ay * dyn_ay + dyn_az * dyn_az);
+  constexpr float VEL_DECAY = 0.92f;
+  constexpr float ACCEL_GATE = 0.15f;
 
   if (dynMag > ACCEL_GATE && penState == PenState::WRITING) {
     velocity.x = velocity.x * VEL_DECAY + dyn_ax * DT;
     velocity.y = velocity.y * VEL_DECAY + dyn_ay * DT;
     velocity.z = velocity.z * VEL_DECAY + dyn_az * DT;
   } else {
-    velocity *= VEL_DECAY * 0.8f; // decay faster when idle
+    velocity *= VEL_DECAY * 0.8f;
   }
   position += velocity * DT;
 
@@ -475,15 +549,15 @@ void Visualizer::drawCube(const IMUData &imu) {
   // Direct per-axis scale factors (radians → GL units):
   //   Horizontal: 50 mm ≈ 0.108 rad of raw GZ → 5.5 GL/rad
   //   Vertical:   50 mm ≈ 0.012 rad of raw GY → 25.0 GL/rad
-  constexpr float SCALE_HORIZ = 5.5f;   // GL units per radian (from GZ)
+  constexpr float SCALE_HORIZ = 12.0f;  // GL units per radian (from GZ)
   constexpr float SCALE_VERT  = 25.0f;  // GL units per radian (from GY)
   constexpr float POS_TO_GL   = 6.0f;   // accel position scale (calibrated)
 
   // Gyro component: raw axes, signs from calibration
   //   rightward → GZ negative → negate for +X
   //   upward    → GY negative → negate for +Y
-  float gyro_x = -intRawGZ * SCALE_HORIZ;
-  float gyro_y = -intYaw * SCALE_VERT;  // intYaw = integrated raw GY
+  float gyro_x = -canvasGZ * SCALE_HORIZ;
+  float gyro_y = -canvasGY * SCALE_VERT;
 
   // Accel component: heavily reduced — calibration showed it's mostly drift.
   float accel_x = -position.y * POS_TO_GL;
