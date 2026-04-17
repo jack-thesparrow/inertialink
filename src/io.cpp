@@ -1,4 +1,5 @@
 #include "pen/io.hpp"
+#include <arpa/inet.h>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -277,6 +278,22 @@ void PenBackend::disconnect() {
   activeReader.reset();
   currentMode   = ConnectionMode::None;
   currentStatus = "Disconnected";
+}
+
+void PenBackend::sendFeedback(const std::string &msg) {
+  if (currentMode == ConnectionMode::USB) {
+    static_cast<SerialReader *>(activeReader.get())->sendCommand(msg);
+  } else if (currentMode == ConnectionMode::WiFi) {
+    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return;
+    struct sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons(Defaults::wifiFeedbackPort);
+    ::inet_pton(AF_INET, Defaults::wifiFeedbackTarget, &dest.sin_addr);
+    ::sendto(s, msg.c_str(), msg.size(), 0,
+             reinterpret_cast<const struct sockaddr *>(&dest), sizeof(dest));
+    ::close(s);
+  }
 }
 
 namespace device {
