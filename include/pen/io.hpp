@@ -21,6 +21,9 @@ struct Defaults {
   // two ports guarantee each process sees every packet independently.
   static constexpr int wifiPort = 5005;    // decoder
   static constexpr int wifiVizPort = 5006; // visualizer
+  // Feedback channel: host→pen (STATE/PRED commands for the OLED display)
+  static constexpr const char *wifiFeedbackTarget = "192.168.4.1";
+  static constexpr int wifiFeedbackPort = 5007;
 
   // Physics — distance (mm) from wrist pivot to pen tip used by both the
   // data collector and the ML decoder to project IMU angles onto 2-D canvas.
@@ -114,11 +117,14 @@ public:
   // connectUSB: opens the port and immediately sends "MODE:USB\n" so the
   // firmware starts streaming regardless of its current state.
   void connectUSB(const std::string &port = Defaults::usbPort);
-  // Backward-compat shim: Bluetooth transport is deprecated; this falls back to
-  // USB handling.
   void connectBluetooth(const std::string &port = Defaults::btPort);
   void connectWiFi(int listenPort = Defaults::wifiPort);
   void disconnect();
+
+  // Send a STATE:xxx or PRED:char:conf command back to the ESP32 OLED.
+  // USB mode  → writes to the serial port.
+  // WiFi mode → sends a UDP packet to 192.168.4.1:5007.
+  void sendFeedback(const std::string &msg);
 
   void setSmoothing(float alpha) { filter.setAlpha(alpha); }
 

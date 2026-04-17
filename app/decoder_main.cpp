@@ -182,7 +182,8 @@ static std::string ctc_beam_search(
 // ONNX INFERENCE & CTC DECODER
 // ---------------------------------------------------------
 void runAIInference(Ort::Session &session,
-                    const std::vector<DataPoint> &strokeBuffer) {
+                    const std::vector<DataPoint> &strokeBuffer,
+                    pen::PenBackend &backend) {
   if (strokeBuffer.empty())
     return;
 
@@ -250,6 +251,16 @@ void runAIInference(Ort::Session &session,
       std::cout << ">> PER CHAR   : " << per_char << "\n";
     }
     std::cout << "====================================\n\n";
+
+    // Feed result back to the ESP32 OLED (STATE already set to PROCESSING)
+    char fbuf[32];
+    if (corrected.empty()) {
+      backend.sendFeedback("PRED::0\n");
+    } else {
+      std::snprintf(fbuf, sizeof(fbuf), "PRED:%s:%d\n",
+                    corrected.c_str(), static_cast<int>(overall_confidence));
+      backend.sendFeedback(fbuf);
+    }
 
   } catch (const Ort::Exception &e) {
     std::cerr << "[ONNX Error] " << e.what() << "\n";
@@ -331,6 +342,7 @@ int main(int argc, char *argv[]) {
 
   std::cout << "\n[IDLE] Waiting for pen activity...\n";
   writeMode("idle");
+  backend.sendFeedback("STATE:IDLE\n");
 
   while (true) {
     if (!backend.getLatestData(currentData))
@@ -367,6 +379,7 @@ int main(int argc, char *argv[]) {
         strokeBuffer.clear();
         std::cout << "[WRITING] Pen activity detected — recording...\n";
         writeMode("Reading stroke...");
+        backend.sendFeedback("STATE:WRITING\n");
         // Record the triggering frame
         strokeBuffer.push_back({currentData.ax, currentData.ay, currentData.az,
                                 currentData.gx, currentData.gy, currentData.gz});
@@ -385,6 +398,7 @@ int main(int argc, char *argv[]) {
           quietFrames = 0;
           std::cout << "[LIFTED] Pen lifted — waiting for more writing or timeout...\n";
           writeMode("Pen lifted...");
+          backend.sendFeedback("STATE:LIFTED\n");
         }
       } else {
         quietFrames = 0;
@@ -402,6 +416,7 @@ int main(int argc, char *argv[]) {
         quietFrames = 0;
         std::cout << "[WRITING] Pen back on paper — continuing...\n";
         writeMode("Reading stroke...");
+        backend.sendFeedback("STATE:WRITING\n");
       } else {
         quietFrames++;
         if (quietFrames > IDLE_QUIET_FRAMES) {
@@ -412,9 +427,10 @@ int main(int argc, char *argv[]) {
           std::cout << "[PROCESSING] Stroke complete (" << strokeBuffer.size()
                     << " frames). Running AI inference...\n";
           writeMode("Predicting...");
+          backend.sendFeedback("STATE:PROCESSING\n");
 
           if (strokeBuffer.size() > 20 && session) {
-            runAIInference(*session, strokeBuffer);
+            runAIInference(*session, strokeBuffer, backend);
           } else if (strokeBuffer.size() <= 20) {
             std::cout << "[SKIPPED] Too few frames (" << strokeBuffer.size()
                       << ") — likely accidental tap.\n";
@@ -423,6 +439,7 @@ int main(int argc, char *argv[]) {
           strokeBuffer.clear();
           std::cout << "\n[IDLE] Waiting for pen activity...\n";
           writeMode("idle");
+          backend.sendFeedback("STATE:IDLE\n");
         }
       }
       break;

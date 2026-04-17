@@ -17,7 +17,7 @@
 //   MPU6050   SDA→GPIO 21   SCL→GPIO 22   I2C address 0x68
 //   SSD1306   SDA→GPIO 21   SCL→GPIO 22   I2C address 0x3C   (no conflict)
 //   Btn1      GPIO 14 ↔ GND   —  toggles WIRED ↔ WIFI
-//   Btn2      GPIO 27 ↔ GND   —  forces  WIRED
+//   Btn2      GPIO 27 ↔ GND   —  toggles IMU view ↔ Prediction view
 //
 // Serial commands at 115200 baud (TUI or any terminal):
 //   MODE:USB    switch to / stay in WIRED mode
@@ -55,7 +55,7 @@ static bool oledOk = false;
 // ── Push buttons (active-LOW, internal pull-up)
 // ───────────────────────────────
 #define BTN_CYCLE_PIN 14 // toggle WIRED ↔ WIFI
-#define BTN_RESET_PIN 27 // force WIRED
+#define BTN_RESET_PIN 27 // toggle IMU ↔ Prediction view
 #define DEBOUNCE_MS 200
 static unsigned long lastBtn1Ms = 0, lastBtn2Ms = 0;
 
@@ -77,6 +77,19 @@ static WiFiUDP udp;
 // Live IMU values (globals so drawDisplay can read them without passing args)
 static float imu_ax = 0.0f, imu_ay = 0.0f, imu_az = 0.0f;
 static float imu_gx = 0.0f, imu_gy = 0.0f, imu_gz = 0.0f;
+
+// ── Display view & prediction state ──────────────────────────────────────────
+enum DisplayView { IMU_VIEW, PRED_VIEW };
+static DisplayView displayView = IMU_VIEW;
+
+// Updated by STATE:xxx / PRED:char:conf feedback from the host decoder.
+static char predStateStr[20] = "IDLE";
+static char predChar[8]      = "";
+static int  predConf         = 0;
+
+// UDP socket that receives STATE/PRED feedback from the host in Wi-Fi mode.
+static WiFiUDP feedbackUdp;
+static constexpr int UDP_FEEDBACK_PORT = 5007;
 
 // ── OLED helpers
 // ──────────────────────────────────────────────────────────────
@@ -111,6 +124,41 @@ static const char *modeName(Mode m) {
 //  │ B1:->WIFI   B2:WIRED                                       │ y=55
 //  └─────────────────────────────────────────────────────────────┘
 
+// ── drawDisplay
+// ───────────────────────────────────────────────────────────────
+//
+// Panel colour zones (fixed by hardware — not configurable):
+//   y  0–15  → YELLOW   (16 px, 2 text rows)
+//   y 16–63  → BLUE     (48 px, 6 text rows)
+//
+// Tab bar (Row 0): WIRED & WIFI show transport mode; PRED shows view mode.
+// Multiple tabs can be active simultaneously (e.g. WIRED + PRED both lit).
+//
+//  IMU view:
+//  ┌──────── YELLOW ────────────────────────────────────────────┐
+//  │ ▓WIRED▓   WIFI    PRED                                    │ y=0
+//  │ [*] USB 115200 baud                                       │ y=9
+//  ├──────── BLUE ──────────────────────────────────────────────┤
+//  │ AX:+1.23  AY:-0.45                                        │ y=18
+//  │ AZ:+0.98  GZ: +89.0                                       │ y=27
+//  │▓▓ GX:+12.3  GY: -5.6 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│ y=37
+//  │─────────────────────────────────────────────────────────── │ y=47
+//  │ B1:->WIFI  B2:PRED                                        │ y=55
+//  └────────────────────────────────────────────────────────────┘
+//
+//  Prediction view (Btn2 active):
+//  ┌──────── YELLOW ────────────────────────────────────────────┐
+//  │  WIRED   ▓WIFI▓  ▓PRED▓                                  │ y=0
+//  │ [*] AP:InertiaLink                                        │ y=9
+//  ├──────── BLUE ──────────────────────────────────────────────┤
+//  │ WRITING                                                   │ y=18
+//  │         >> "3"          (TextSize=2)                      │ y=28
+//  │                                                           │
+//  │             CONF:  87%                                    │ y=46
+//  │─────────────────────────────────────────────────────────── │ y=54
+//  │ B1:->WIRED B2:IMU                                         │ y=55
+//  └────────────────────────────────────────────────────────────┘
+
 static uint8_t animTick = 0;
 
 static void drawDisplay() {
@@ -123,34 +171,31 @@ static void drawDisplay() {
   display.setTextSize(1);
 
   // ════ YELLOW ZONE ══════════════════════════════════════════════════════════
-  // Fill the whole zone white — the panel renders this as yellow.
   display.fillRect(0, 0, SCREEN_W, 16, SSD1306_WHITE);
 
-  // ── Row 0 (y=0–8): three mode tabs, active tab inverted ────────────────────
-  // Tab x-positions spread across 128 px.
-  static const struct { const char *label; uint8_t x; Mode mode; } TABS[] = {
-    {"WIRED",  2, WIRED},
-    {"WIFI",  50, WIFI },
-    {"IDLE",  96, IDLE },
-  };
-  for (const auto &t : TABS) {
-    if (currentMode == t.mode) {
-      // Active: black box filled in the yellow stripe → appears as dark tab
-      uint8_t w = static_cast<uint8_t>(strlen(t.label) * 6);
-      display.fillRect(t.x - 1, 0, w + 2, 9, SSD1306_BLACK);
+  // ── Row 0: WIRED / WIFI track transport; PRED tracks view ─────────────────
+  static const struct {
+    const char *label;
+    uint8_t     x;
+  } TABS[3] = {{"WIRED", 2}, {"WIFI", 50}, {"PRED", 96}};
+  bool tabActive[3] = {currentMode == WIRED, currentMode == WIFI,
+                       displayView == PRED_VIEW};
+  for (int i = 0; i < 3; i++) {
+    if (tabActive[i]) {
+      uint8_t w = static_cast<uint8_t>(strlen(TABS[i].label) * 6);
+      display.fillRect(TABS[i].x - 1, 0, w + 2, 9, SSD1306_BLACK);
       display.setTextColor(SSD1306_WHITE);
     } else {
       display.setTextColor(SSD1306_BLACK);
     }
-    display.setCursor(t.x, 1);
-    display.print(t.label);
+    display.setCursor(TABS[i].x, 1);
+    display.print(TABS[i].label);
   }
 
-  // ── Row 1 (y=9–15): live badge + transport info ────────────────────────────
+  // ── Row 1: live badge + transport detail ───────────────────────────────────
   display.setTextColor(SSD1306_BLACK);
   display.setCursor(0, 9);
   if (currentMode == WIFI) {
-    // Show AP SSID so the user sees what network to join
     char r[22];
     snprintf(r, sizeof(r), "%s AP:%-11s", liveOn ? "[*]" : "[ ]", AP_SSID);
     display.print(r);
@@ -166,41 +211,73 @@ static void drawDisplay() {
   // ════ BLUE ZONE ════════════════════════════════════════════════════════════
   display.setTextColor(SSD1306_WHITE);
 
-  if (currentMode == IDLE) {
-    display.setCursor(0, 19); display.print("[B1] Cycle mode");
-    display.setCursor(0, 29); display.print("[B2] Force WIRED");
-    display.setCursor(0, 41); display.print("AP:  " AP_SSID);
-    display.setCursor(0, 51); display.print("pw:  " AP_PASS);
-    display.display();
-    return;
+  if (displayView == PRED_VIEW) {
+    // ── Prediction screen ─────────────────────────────────────────────────────
+    char stateLabel[21];
+    snprintf(stateLabel, sizeof(stateLabel), "%-20s", predStateStr);
+    display.setCursor(0, 18);
+    display.print(stateLabel);
+
+    // Large prediction centred at TextSize=2 (16 px tall), capped at 3 chars
+    display.setTextSize(2);
+    if (predChar[0] != '\0') {
+      char disp[4];
+      strncpy(disp, predChar, 3);
+      disp[3] = '\0';
+      char predLine[12];
+      snprintf(predLine, sizeof(predLine), ">> \"%s\"", disp);
+      int px = (SCREEN_W - static_cast<int>(strlen(predLine)) * 12) / 2;
+      display.setCursor(px < 0 ? 0 : px, 28);
+      display.print(predLine);
+    } else {
+      display.setCursor(22, 28); // "WAITING": 7 chars × 12 px = 84 px centred
+      display.print("WAITING");
+    }
+    display.setTextSize(1);
+
+    char confLine[14];
+    if (predChar[0] != '\0')
+      snprintf(confLine, sizeof(confLine), "CONF:  %3d%%", predConf);
+    else
+      snprintf(confLine, sizeof(confLine), "CONF:   --%%");
+    display.setCursor(28, 46);
+    display.print(confLine);
+
+    display.drawFastHLine(0, 54, SCREEN_W, SSD1306_WHITE);
+    display.setCursor(0, 55);
+    display.print(currentMode == WIRED ? "B1:->WIFI  B2:IMU " : "B1:->WIRED B2:IMU ");
+
+  } else {
+    // ── IMU screen ────────────────────────────────────────────────────────────
+    if (currentMode == IDLE) {
+      display.setCursor(0, 19); display.print("[B1] WIFI / WIRED");
+      display.setCursor(0, 29); display.print("[B2] Pred view");
+      display.setCursor(0, 41); display.print("AP:  " AP_SSID);
+      display.setCursor(0, 51); display.print("pw:  " AP_PASS);
+      display.display();
+      return;
+    }
+
+    char buf[22];
+    snprintf(buf, sizeof(buf), "AX:%+5.2f  AY:%+5.2f", imu_ax, imu_ay);
+    display.setCursor(0, 18);
+    display.print(buf);
+
+    snprintf(buf, sizeof(buf), "AZ:%+5.2f  GZ:%+6.1f", imu_az, imu_gz);
+    display.setCursor(0, 27);
+    display.print(buf);
+
+    display.fillRect(0, 36, SCREEN_W, 9, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    snprintf(buf, sizeof(buf), "GX:%+5.1f  GY:%+5.1f", imu_gx, imu_gy);
+    display.setCursor(0, 37);
+    display.print(buf);
+
+    display.setTextColor(SSD1306_WHITE);
+    display.drawFastHLine(0, 47, SCREEN_W, SSD1306_WHITE);
+    display.setCursor(0, 55);
+    display.print(currentMode == WIRED ? "B1:->WIFI  B2:PRED" : "B1:->WIRED B2:PRED");
   }
-
-  // ── 6-DOF readings ─────────────────────────────────────────────────────────
-  char buf[22];
-
-  // Accel X & Y
-  snprintf(buf, sizeof(buf), "AX:%+5.2f  AY:%+5.2f", imu_ax, imu_ay);
-  display.setCursor(0, 18);
-  display.print(buf);
-
-  // Accel Z + Gyro Z (primary writing-motion channels)
-  snprintf(buf, sizeof(buf), "AZ:%+5.2f  GZ:%+6.1f", imu_az, imu_gz);
-  display.setCursor(0, 27);
-  display.print(buf);
-
-  // Gyro X & Y — inverted band for contrast against the blue background
-  display.fillRect(0, 36, SCREEN_W, 9, SSD1306_WHITE);
-  display.setTextColor(SSD1306_BLACK);
-  snprintf(buf, sizeof(buf), "GX:%+5.1f  GY:%+5.1f", imu_gx, imu_gy);
-  display.setCursor(0, 37);
-  display.print(buf);
-
-  // Separator + button hints
-  display.setTextColor(SSD1306_WHITE);
-  display.drawFastHLine(0, 47, SCREEN_W, SSD1306_WHITE);
-  display.setCursor(0, 55);
-  display.print(currentMode == WIRED ? "B1:->WIFI   B2:WIRED"
-                                     : "B1:->WIRED  B2:WIRED");
 
   display.display();
 }
@@ -248,7 +325,6 @@ static void parseCommand(const char *cmd) {
     Serial.println("[ESP] Mode -> IDLE");
 
   } else if (strcmp(cmd, "MODE:WIFI") == 0) {
-    // SoftAP is already running since setup() — just flip the mode flag.
     if (apReady) {
       currentMode = WIFI;
       Serial.println("[ESP] Mode -> WIFI (SoftAP: " AP_SSID ")");
@@ -256,6 +332,26 @@ static void parseCommand(const char *cmd) {
     } else {
       Serial.println("[ESP] WiFi failed -> SoftAP not ready");
     }
+
+  } else if (strncmp(cmd, "STATE:", 6) == 0) {
+    strncpy(predStateStr, cmd + 6, sizeof(predStateStr) - 1);
+    predStateStr[sizeof(predStateStr) - 1] = '\0';
+    if (displayView == PRED_VIEW) drawDisplay();
+    return; // skip the drawDisplay() at the end
+
+  } else if (strncmp(cmd, "PRED:", 5) == 0) {
+    // Format: PRED:<char>:<confidence>   e.g. "PRED:3:87"  or "PRED::0"
+    const char *rest  = cmd + 5;
+    const char *colon = strchr(rest, ':');
+    if (colon) {
+      int charLen = static_cast<int>(colon - rest);
+      if (charLen > 7) charLen = 7;
+      strncpy(predChar, rest, charLen);
+      predChar[charLen] = '\0';
+      predConf = atoi(colon + 1);
+    }
+    if (displayView == PRED_VIEW) drawDisplay();
+    return;
   }
 
   drawDisplay();
@@ -278,15 +374,32 @@ static void pollSerial() {
   }
 }
 
+// ── Feedback UDP poll (Wi-Fi mode — receives STATE/PRED from host decoder)
+// ────────
+static void pollFeedbackUdp() {
+  int n = feedbackUdp.parsePacket();
+  if (n <= 0)
+    return;
+  char buf[64];
+  int len = feedbackUdp.read(buf, sizeof(buf) - 1);
+  if (len <= 0)
+    return;
+  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+    --len;
+  buf[len] = '\0';
+  if (len > 0)
+    parseCommand(buf);
+}
+
 // ── Button handler
 // ────────────────────────────────────────────────────────────
 static void handleButtons() {
   unsigned long now = millis();
 
-  // Btn1: WIRED → WIFI (if AP is up) / WIFI or IDLE → WIRED
+  // Btn1: toggle WIRED ↔ WIFI
   if (digitalRead(BTN_CYCLE_PIN) == LOW && (now - lastBtn1Ms) > DEBOUNCE_MS) {
     lastBtn1Ms = now;
-    if (currentMode == WIRED) {
+    if (currentMode != WIFI) {
       if (apReady) {
         currentMode = WIFI;
         Serial.println("[ESP] Btn1 -> WIFI");
@@ -301,11 +414,12 @@ static void handleButtons() {
     drawDisplay();
   }
 
-  // Btn2: force WIRED from any mode
+  // Btn2: toggle IMU view ↔ Prediction view
   if (digitalRead(BTN_RESET_PIN) == LOW && (now - lastBtn2Ms) > DEBOUNCE_MS) {
     lastBtn2Ms = now;
-    currentMode = WIRED;
-    Serial.println("[ESP] Btn2 -> WIRED");
+    displayView = (displayView == IMU_VIEW) ? PRED_VIEW : IMU_VIEW;
+    Serial.println(displayView == PRED_VIEW ? "[ESP] Btn2 -> PRED view"
+                                            : "[ESP] Btn2 -> IMU view");
     drawDisplay();
   }
 }
@@ -347,7 +461,10 @@ void setup() {
   WiFi.mode(WIFI_AP);
   if (WiFi.softAP(AP_SSID, AP_PASS)) {
     apReady = true;
+    feedbackUdp.begin(UDP_FEEDBACK_PORT);
     Serial.println("[ESP] SoftAP up: " AP_SSID " -> 192.168.4.1");
+    Serial.println("[ESP] Feedback UDP listening on port " +
+                   String(UDP_FEEDBACK_PORT));
   } else {
     Serial.println("[ESP] SoftAP failed — WiFi mode unavailable");
     splashOLED("SoftAP failed!", "WIRED only");
@@ -366,6 +483,8 @@ static const unsigned long DISP_INTERVAL_MS = 100; // ~10 Hz OLED refresh
 void loop() {
   handleButtons();
   pollSerial();
+  if (currentMode == WIFI)
+    pollFeedbackUdp();
 
   if (currentMode != IDLE) {
     mpu.update();
