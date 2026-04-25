@@ -14,8 +14,9 @@ import numpy as np
 import pandas as pd
 import scipy.interpolate as interp
 
-LABELS = list("0123456789")
-SAMPLES_PER_CLASS = 1000
+LABELS = list("123ABC")
+# Default to light augmentation: 0.5x of 1200 real samples.
+SAMPLES_PER_CLASS = int(os.getenv("AUG_SAMPLES_PER_CLASS", "600"))
 
 def time_warp(df, factor=1.0):
     """
