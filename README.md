@@ -2,20 +2,21 @@
 
 > Motion-sensor handwriting recognition — no camera, no touchscreen, just physics.
 
-Inertialink turns an ESP32 + MPU6050 IMU into a smart pen that streams angular
-velocity over USB or WiFi. A BiLSTM + CTC neural network running on
-your desktop decodes the motion into text in real time. A lazygit-style terminal
-UI lets you launch, test, and monitor every component from one screen.
+Inertialink turns an ESP32 + MPU6050 IMU into a smart pen that streams raw
+6-DOF sensor data (accelerometer + gyroscope) over USB or WiFi. A BiLSTM + CTC
+neural network running on your desktop decodes the motion into characters in
+real time. A lazygit-style terminal UI lets you launch, test, and monitor every
+component from one screen.
 
 ```
 ESP32 / MPU6050                Desktop (C++ + Python)
 ──────────────────             ──────────────────────────────────────────
-  pitch                WiFi    ┌──────────────┐    ONNX    ┌───────────┐
-  roll    ──100Hz UDP──────▶   │   decoder    │  ───────▶  │  BiLSTM   │
-  yaw                          │  (C++/ONNX)  │            │  + CTC    │
-  accel_z              USB     └──────────────┘            └───────────┘
-                  Serial──▶                                      │
-                               ┌──────────────┐            "hello" (94%)
+  ax, ay, az           WiFi    ┌──────────────┐    ONNX    ┌───────────┐
+  gx, gy, gz ──100Hz UDP───▶   │   decoder    │  ───────▶  │  BiLSTM   │
+  (6-DOF raw)          USB     │  (C++/ONNX)  │            │  + CTC    │
+                  Serial──▶    └──────────────┘            └───────────┘
+                                                                 │
+                               ┌──────────────┐            "A" / "3" (94%)
                                │  visualizer  │  ◀── stroke trail + HUD
                                │ (OpenGL 3.3) │
                                └──────────────┘
@@ -67,9 +68,11 @@ The firmware supports **three modes** switchable at runtime via serial commands:
 
 **Packet format** (all modes):
 ```
-pitch_deg,roll_deg,yaw_deg,accel_z\n
-12.34,0.0000,-5.67,0.12\n
+ax,ay,az,gx,gy,gz\n
+-0.75,0.04,0.63,-0.45,-0.47,-0.49\n
 ```
+
+Values are raw IMU readings: accelerometer in g-force and gyroscope in deg/s.
 
 ---
 
@@ -190,29 +193,28 @@ For the model to generalise, collect at least 10 samples per word.
 
 **CSV format:**
 ```
-time_ms,x,y,accel_z
-0,0.0,0.0,0.12
-10,1.2,0.8,0.10
+time_ms,ax,ay,az,gx,gy,gz
+0,-0.75,0.04,0.63,-0.45,-0.47,-0.49
+10,-0.72,0.08,0.67,-0.86,0.18,-0.25
 ```
-`x` and `y` are lever-arm projected positions in mm.
+Raw 6-DOF sensor readings: accelerometer (g-force) and gyroscope (deg/s).
 
 ---
 
 ### 3. Generate synthetic data
 
-If you don't have hardware yet (or want to augment real data), generate 2 400
-high-quality synthetic samples:
+If you don't have hardware yet (or want to augment real data), generate synthetic
+samples:
 
 ```bash
 source .venv/bin/activate
 python3 scripts/augment_seed_data.py
 ```
 
-Creates `data/{word}/sample_001.csv … sample_200.csv` for all 12 trained words.
-Each character has a unique, physically-motivated oscillation profile with
-per-sample augmentation (speed jitter ±30%, position noise, pressure variation).
-
-Output: ~300 MB of CSV files.
+Creates `data/{label}/sample_001.csv … sample_NNN.csv` for all trained classes
+(`1`, `2`, `3`, `A`, `B`, `C`). Each class has a unique, physically-motivated
+6-DOF oscillation profile with per-sample augmentation (speed jitter ±30%,
+sensor noise, orientation variation).
 
 ---
 
@@ -223,7 +225,7 @@ python3 scripts/train_bilstm.py
 ```
 
 **What happens:**
-- Reads all CSVs (or loads `data/dataset_cache.pt` if already cached)
+- Reads all CSVs (or loads `data/dataset_cache_123ABC.pt` if already cached)
 - Trains a 2-layer BiLSTM + CTC network for up to 300 epochs
 - Saves `models/pen_model.onnx` (loaded by the C++ decoder)
 - Saves `models/checkpoint.pt` every 2 epochs (safe to Ctrl+C and resume)
@@ -270,10 +272,9 @@ python3 scripts/mock_esp32.py hello
 **Decoder output:**
 ```
 ====================================
->> PREDICTION : "hello"
->> RAW CTC    : "helo" (snapped to vocab)
+>> PREDICTION : "A"
 >> CONFIDENCE : 94%
->> PER CHAR   : h=98%  e=91%  l=96%  l=95%  o=86%
+>> PER CHAR   : A=94%
 ====================================
 ```
 
@@ -283,11 +284,12 @@ decoder mode (green = reading, yellow = predicting).
 The decoder pipeline:
 
 ```
-UDP frame
-  → impact detection (Z > 0.5 m/s²)
-  → buffer stroke until 2 s idle
-  → project angles → x/y mm  [x = -yaw×150, y = pitch×150]
-  → ONNX inference  [BiLSTM logits]
+UDP frame  (ax, ay, az, gx, gy, gz @ 100 Hz)
+  → activity detection (jerk > 12 g/s OR gyro > 15 deg/s)
+  → buffer stroke until 500 ms quiet (LIFTED)
+  → 2 s extended silence → stroke complete
+  → stroke trimmer (removes quiet tail > 70 frames)
+  → ONNX inference  [1, seq_len, 6] → BiLSTM logits
   → CTC beam search (width=10)
   → Levenshtein snap to vocab (edit distance ≤ 2)
   → print prediction
@@ -469,9 +471,24 @@ Writes `models/eval_results.csv` and `models/eval_summary.csv`.
 
 ---
 
+### `scripts/augment_hard_samples.py`
+
+Generate targeted training samples from mistakes in `eval_results.csv`.
+
+```bash
+python3 scripts/augment_hard_samples.py
+python3 scripts/augment_hard_samples.py --per-mistake 30 --max-per-label 400
+```
+
+Writes new files to `data/hard/<label>/hard_*.csv`. Training automatically
+includes this folder.
+
+---
+
 ## Configuration
 
-All physics constants are in one place: `include/pen/io.hpp`.
+Hardware I/O constants are in `include/pen/io.hpp`. Activity thresholds for the
+decoder state machine live in `app/decoder_main.cpp`:
 
 ```cpp
 namespace pen {
@@ -479,17 +496,17 @@ struct Defaults {
     static constexpr const char *usbPort        = "/dev/ttyUSB0";
     static constexpr int   wifiPort             = 5005;    // decoder UDP
     static constexpr int   wifiVizPort          = 5006;    // visualizer UDP
-    static constexpr float leverArmMm           = 150.0f;  // wrist → pen tip
-    static constexpr float wakeThresholdZ       = 0.5f;    // impact shock (m/s²)
-    static constexpr float activityThreshold    = 0.02f;   // min angle delta (rad)
-    static constexpr int   idleTimeoutMs        = 2000;    // pen-lift detection
 };
 }
-```
 
-> **Important:** `leverArmMm` and `idleTimeoutMs` are also hard-coded in the
-> Python scripts. If you change them, update `scripts/mock_esp32.py`
-> (`LEVER_ARM_MM`) and regenerate synthetic data before retraining.
+// decoder_main.cpp — tunable activity detection
+constexpr float JERK_IMPACT_THRESHOLD = 12.0f; // g/s  — pen touches surface
+constexpr float JERK_QUIET_THRESHOLD  = 2.0f;  // g/s  — pen is still
+constexpr float GYRO_ACTIVE_THRESHOLD = 15.0f; // deg/s — pen is moving
+constexpr float GYRO_QUIET_THRESHOLD  = 5.0f;  // deg/s — pen is still
+constexpr int   LIFT_QUIET_FRAMES     = 50;    // 500 ms quiet → LIFTED
+constexpr int   IDLE_QUIET_FRAMES     = 200;   // 2 s quiet after lift → infer
+```
 
 ---
 
@@ -516,6 +533,23 @@ sudo usermod -aG video,render $USER
 # Generate data inside container
 ./docker/train_xpu.sh python3 scripts/augment_seed_data.py
 ```
+
+### Decoder/Evaluation in Docker (Intel Arc + CPU fallback)
+
+```bash
+# Evaluate with provider auto-select (OpenVINO GPU -> CPU fallback)
+./docker/decode_xpu.sh
+
+# Force CPU inside the same container
+MODEL_DEVICE=cpu ./docker/decode_xpu.sh
+
+# Run any command in the same Arc-enabled image
+./docker/decode_xpu.sh python3 scripts/eval_model.py 1 2 3 A B C
+```
+
+`scripts/eval_model.py` now selects ONNX Runtime providers in this order:
+OpenVINO GPU first (when available), then CPU fallback. You can override with
+`MODEL_DEVICE=auto|xpu|gpu|cpu`.
 
 The container mounts the project root, so `data/` and `models/` are written to
 your local filesystem. The image is based on
@@ -549,7 +583,8 @@ inertialink/
 │   └── src/main.cpp        MPU6050 → pitch/roll/yaw → USB/BT/WiFi UDP
 ├── docker/
 │   ├── Dockerfile.xpu
-│   └── train_xpu.sh
+│   ├── train_xpu.sh
+│   └── decode_xpu.sh
 ├── third_party/
 │   ├── glad/
 │   └── stb/stb_easy_font.h
@@ -569,19 +604,20 @@ inertialink/
 
 ```
 [ESP32 / mock_esp32.py]
-        │  pitch, roll, yaw, accel_z  @100 Hz
+        │  ax, ay, az, gx, gy, gz  @100 Hz  (6-DOF raw IMU)
         │  UDP 5005 ──────────────────────────▶ [decoder]
         │  UDP 5006 ──────────────────────────▶ [visualizer]
         │  Serial ────────────────────────────▶ [decoder / visualizer]
         │
 [decoder]
-  wait for Z-shock (> 0.5 m/s²)
-  buffer frames until 2 s idle
-  project: x_mm = −yaw_rad × 150
-           y_mm =  pitch_rad × 150
-  ONNX → [1, seq, 3] → BiLSTM → [1, seq, 64 logits]
+  activity detection: jerk (g/s) + gyro magnitude (deg/s)
+  IDLE → WRITING on jerk > 12 g/s or gyro > 15 deg/s
+  WRITING → LIFTED after 500 ms quiet (gyro < 5, jerk < 2)
+  LIFTED → IDLE after 2 s extended quiet → infer
+  stroke trimmer: remove tail quiet frames (> 70 frames beyond last active)
+  ONNX → [1, seq, 6] → BiLSTM → [1, seq, 8 logits]
   CTC beam search (width 10) → raw text
-  Levenshtein snap → predicted word
+  Levenshtein snap → predicted character
   write /tmp/inertialink_mode, /tmp/inertialink_word
 
 [visualizer]
@@ -593,28 +629,31 @@ inertialink/
 ### ML model
 
 ```
-Input  (1, seq_len, 3)  — normalized [x_mm, y_mm, accel_z]
+Input  (1, seq_len, 6)  — raw [ax, ay, az, gx, gy, gz]
   ↓  Z-score normalization (baked into ONNX, no pre-processing needed)
   ↓  BiLSTM (128 units, 2 layers, bidirectional, dropout 0.3)
-  ↓  Dense (256 → 64)
-Output (1, seq_len, 64) — log-softmax over alphabet + CTC blank
+  ↓  Dense (256 → 8)
+Output (1, seq_len, 8)  — log-softmax over alphabet + CTC blank
 ```
 
-**Alphabet (64 chars):**
-`~` (blank) + space + `a-z` + `A-Z` + `0-9`
+**Alphabet (8 chars):**
+`~` (blank) + space + `1 2 3 A B C`
 
-**Trained vocabulary (12 words):**
-`hello world pen 123 write note data code test abc xyz open`
+**Trained classes (6 characters):**
+`1  2  3  A  B  C`
 
 ---
 
 ## Roadmap
 
-- [ ] Full character set (62 chars: a–z, A–Z, 0–9) — profiles already drafted
-- [ ] Remove vocab snapping — open-vocabulary CTC for any word
-- [ ] Space character training → multi-word sentences
+- [x] 6-DOF raw IMU pipeline (ax/ay/az + gx/gy/gz) replacing projected x/y
+- [x] Jerk + gyro magnitude activity detection replacing Z-accel threshold
+- [x] Stroke trimmer — removes quiet tail frames to match training distribution
+- [x] Character recognition (1–3, A–C) — first working character set
+- [ ] Expand to full digit set (0–9) and uppercase alphabet (A–Z)
+- [ ] Remove vocab snapping — open-vocabulary CTC for arbitrary input
+- [ ] Space character training → multi-character words and sentences
 - [ ] Real-hardware fine-tuning with physical pen data
-- [ ] Sentence buffer → print on pause / punctuation
 - [ ] macOS / Windows port (GLFW and ONNX Runtime are cross-platform)
 
 ---

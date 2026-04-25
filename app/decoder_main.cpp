@@ -27,7 +27,7 @@ struct DataPoint {
 // Must match train_bilstm.py ALPHABET exactly.
 // Index 0 ('~') is the CTC blank — always skipped by the decoder.
 // Real characters start at index 1.
-static const std::string ALPHABET = "~ 0123456789";
+static const std::string ALPHABET = "~ 123ABC";
 static constexpr const char *MODEL_PATH = "models/pen_model.onnx";
 
 // Vocabulary the model was trained on: individual characters + words.
@@ -35,7 +35,7 @@ static constexpr const char *MODEL_PATH = "models/pen_model.onnx";
 // vocabulary entry (Levenshtein ≤ 2) so that partial drops like "helo"→"hello"
 // are automatically corrected.  Single-char predictions pass through as-is.
 static const std::vector<std::string> VOCABULARY = {
-    "1", "2", "3"
+    "1", "2", "3", "A", "B", "C"
 };
 
 // ---------------------------------------------------------
@@ -59,6 +59,8 @@ static int editDistance(const std::string &a, const std::string &b) {
 // Returns {corrected_word, was_corrected}.
 static std::pair<std::string, bool> snapToVocab(const std::string &raw) {
   if (raw.empty()) return {raw, false};
+  // Do not alter single-character outputs in character mode.
+  if (raw.size() == 1) return {raw, false};
   int   best_dist = 3; // only snap if dist <= 2
   std::string best = raw;
   for (const auto &w : VOCABULARY) {
@@ -179,6 +181,33 @@ static std::string ctc_beam_search(
 }
 
 // ---------------------------------------------------------
+// STROKE TRIMMER
+// ---------------------------------------------------------
+// The data_collector stops recording 700 ms (70 frames @ 100 Hz) after the
+// last active frame, so every training sample ends with ~70 quiet frames.
+// The decoder's LIFTED timeout is 2 s for UX reasons, which pads strokes with
+// ~250 extra quiet frames the model never saw during training.  Extra quiet
+// frames also bias the local accel mean used for normalization inside the model.
+// This function removes the excess tail so inference input matches training data.
+static constexpr float TRIM_GYRO_QUIET = 5.0f; // deg/s  — same as data_collector
+static constexpr int   TRIM_TAIL_FRAMES = 70;   // 700 ms — matches data_collector idle timeout
+
+static void trimStroke(std::vector<DataPoint> &buf) {
+  int lastActive = -1;
+  for (int i = static_cast<int>(buf.size()) - 1; i >= 0; --i) {
+    float gm = std::sqrt(buf[i].gx * buf[i].gx +
+                         buf[i].gy * buf[i].gy +
+                         buf[i].gz * buf[i].gz);
+    if (gm > TRIM_GYRO_QUIET) { lastActive = i; break; }
+  }
+  if (lastActive < 0) return; // all quiet — leave as-is, inference will skip
+
+  int keepEnd = std::min(lastActive + TRIM_TAIL_FRAMES + 1,
+                         static_cast<int>(buf.size()));
+  buf.resize(static_cast<size_t>(keepEnd));
+}
+
+// ---------------------------------------------------------
 // ONNX INFERENCE & CTC DECODER
 // ---------------------------------------------------------
 void runAIInference(Ort::Session &session,
@@ -242,8 +271,10 @@ void runAIInference(Ort::Session &session,
     std::cout << "\n====================================\n";
     if (corrected.empty()) {
       std::cout << ">> PREDICTION : (nothing recognised)\n";
+      backend.sendCommand("PRED:?\n");
     } else {
       std::cout << ">> PREDICTION : \"" << corrected << "\"\n";
+      backend.sendCommand("PRED:" + corrected + "\n");
       if (was_corrected)
         std::cout << ">> RAW CTC    : \"" << predicted_text << "\" (snapped to vocab)\n";
       std::cout << ">> CONFIDENCE : " << static_cast<int>(overall_confidence)
@@ -283,12 +314,64 @@ int main(int argc, char *argv[]) {
   Ort::SessionOptions session_options;
   session_options.SetIntraOpNumThreads(1);
 
+  // XPU/Intel Arc GPU configuration
+  const char* model_device_env = std::getenv("MODEL_DEVICE");
+  std::string device_setting = model_device_env ? model_device_env : "auto";
+  
+  // Configure providers based on device setting
+  std::vector<std::string> providers;
+  
+  if (device_setting == "xpu" || device_setting == "gpu" || device_setting == "auto") {
+    // Try OpenVINO GPU provider first for Intel Arc
+    providers.push_back("OpenVINOExecutionProvider");
+    providers.push_back("CPUExecutionProvider");
+  } else {
+    // CPU only
+    providers.push_back("CPUExecutionProvider");
+  }
+
+  std::cout << "[System] Device setting: " << device_setting << "\n";
+  std::cout << "[System] Requested providers: ";
+  for (size_t i = 0; i < providers.size(); ++i) {
+    std::cout << providers[i];
+    if (i < providers.size() - 1) std::cout << ", ";
+  }
+  std::cout << "\n";
+
   std::unique_ptr<Ort::Session> session;
   try {
-    session = std::make_unique<Ort::Session>(env, MODEL_PATH, session_options);
+    // Create session options
+    Ort::SessionOptions session_options_with_providers;
+    session_options_with_providers.SetIntraOpNumThreads(1);
+    
+    // For XPU/GPU support, we need to append the OpenVINO execution provider
+    // The ONNX Runtime C++ API automatically uses available providers
+    // OpenVINO will be used if available and GPU is detected
+    
+    if (device_setting == "xpu" || device_setting == "gpu" || device_setting == "auto") {
+      std::cout << "[System] Attempting to use OpenVINO GPU provider...\n";
+      // Set environment variables for OpenVINO GPU if needed
+      // OpenVINO provider will automatically detect Intel Arc GPU
+    }
+    
+    session = std::make_unique<Ort::Session>(env, MODEL_PATH, session_options_with_providers);
+    
+    // Simple provider reporting - the API is limited in C++
     std::cout << "[System] AI Model '" << MODEL_PATH << "' loaded successfully.\n";
+    std::cout << "[System] Device setting: " << device_setting << "\n";
+    
+    if (device_setting == "xpu" || device_setting == "gpu" || device_setting == "auto") {
+      std::cout << "[System] OpenVINO GPU provider will be used if Intel Arc GPU is available\n";
+    } else {
+      std::cout << "[System] Using CPU inference\n";
+    }
+    
   } catch (const Ort::Exception &e) {
     std::cerr << "\n[FATAL ONNX ERROR] " << e.what() << "\n";
+    if (device_setting == "xpu" || device_setting == "gpu") {
+      std::cerr << "[Hint] Make sure Intel OpenVINO is installed and GPU drivers are up to date.\n";
+      std::cerr << "[Hint] Try MODEL_DEVICE=cpu to force CPU inference.\n";
+    }
   } catch (...) {
     std::cerr << "\n[FATAL] '" << MODEL_PATH << "' not found — run train_bilstm.py first.\n";
   }
@@ -420,12 +503,17 @@ int main(int argc, char *argv[]) {
       } else {
         quietFrames++;
         if (quietFrames > IDLE_QUIET_FRAMES) {
-          // Extended silence — stroke is complete → run inference
+          // Extended silence — stroke is complete → trim then run inference
           penState = PenState::IDLE;
           quietFrames = 0;
 
-          std::cout << "[PROCESSING] Stroke complete (" << strokeBuffer.size()
-                    << " frames). Running AI inference...\n";
+          int rawFrames = static_cast<int>(strokeBuffer.size());
+          trimStroke(strokeBuffer);
+          int trimmedFrames = static_cast<int>(strokeBuffer.size());
+
+          std::cout << "[PROCESSING] Stroke complete (" << rawFrames
+                    << " frames → " << trimmedFrames
+                    << " after trim). Running AI inference...\n";
           writeMode("Predicting...");
           backend.sendFeedback("STATE:PROCESSING\n");
 

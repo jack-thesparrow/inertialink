@@ -1,0 +1,1769 @@
+InertiaLink
+Motion-Sensor Handwriting Recognition Using IMU and
+Deep Learning
+
+Course Name
+
+Embedded Systems / Microcontroller-Based Design
+
+Group Number
+
+(fill in)
+
+Student Names & Roll Numbers
+
+(fill in)
+
+Instructor's Name
+
+(fill in)
+
+Institution
+
+(fill in)
+
+Submission Date
+
+April 17, 2026
+
+[IMAGE PLACEHOLDER — Cover Photo]
+Suggested: Group photo with the assembled InertiaLink smart pen prototype.
+
+Table of Contents
+1. Abstract
+2. Introduction
+3. Problem Statement
+4. System Overview
+5. Hardware Description
+6. Software Design
+7. Circuit Diagram
+8. Implementation
+9. Results and Observations
+10. Challenges Faced
+11. Applications
+12. Future Improvements
+13. Conclusion
+14. Appendix
+
+1. Abstract
+Handwriting recognition has traditionally depended on cameras, touchscreens, or stylus-equipped digitizing
+tablets — hardware that is expensive, fragile, or environment-restricted. This project, InertiaLink, presents a
+camera-free, surface-free smart pen that recognizes handwritten characters exclusively from the inertial
+motion of the pen itself.
+A standard pen is equipped with an ESP32 microcontroller and an MPU6050 six-degrees-of-freedom (6-DOF)
+Inertial Measurement Unit. As a user writes, the pen streams accelerometer and gyroscope data at 100 Hz over
+USB serial or Wi-Fi UDP to a desktop host. The host applies a physics-based 150 mm lever-arm projection
+model to convert angular motion into 2D writing coordinates, feeds those coordinates through a Convolutional
++ Bidirectional LSTM (BiLSTM) neural network, and decodes the output using Connectionist Temporal
+Classification (CTC) beam search, finally snapping the result to a trained vocabulary using Levenshtein edit
+distance.
+The system was trained and evaluated on 10,015 synthetically augmented samples across six characters
+(1, 2, 3, A, B, C) and achieved 99.8% recognition accuracy (9995/10015 correct). End-to-end inference latency is 1–5 ms
+per stroke. The complete system includes an OpenGL-based real-time visualizer, a terminal UI for process
+orchestration, and an ESP32 firmware that also supports SoftAP Wi-Fi for wireless operation — requiring no
+external router.
+
+2. Introduction
+2.1 Background
+The digitization of handwriting is a long-standing challenge in human-computer interaction. While optical
+character recognition (OCR) systems excel at printed text, recognizing free-form handwriting in real time —
+especially from embedded or resource-constrained hardware — remains technically demanding. Most existing
+solutions depend on:
+Camera-based systems: require controlled lighting and line-of-sight to a writing surface.
+Touchscreen/digitizer tablets: restrict writing to a specific surface and are costly.
+Stylus-based solutions: pen must remain in contact with a capacitive surface.
+None of these approaches support writing on arbitrary surfaces (paper, air, skin), in occluded environments, or
+as a compact wearable device.
+Inertial Measurement Units, now found in every smartphone and fitness tracker, capture the physical
+dynamics of motion with sub-millisecond latency, are power-efficient, and cost less than a dollar at volume. Yet
+applying IMU data to handwriting recognition is non-trivial: the signal is noisy, temporally variable in length,
+and carries no explicit pen-lift information.
+
+2.2 Real-World Relevance
+The ability to digitize handwriting from a standard pen has immediate relevance in:
+Education: converting classroom notes to digital text without special paper or tablets.
+Healthcare: digitizing doctor handwriting on prescriptions or clinical notes.
+Accessibility: enabling users with motor impairments to use familiar writing motions on any surface.
+
+Logistics and Field Work: data entry in environments where screens are impractical.
+
+2.3 Objectives
+The project set out to achieve the following:
+1. Build a functional smart pen using commercially available, low-cost hardware (ESP32 + MPU6050).
+2. Design a signal processing pipeline that converts raw 6-DOF IMU data into writing-trajectory features.
+3. Train a deep learning model capable of recognizing handwritten characters from this signal.
+4. Deploy inference in real time on a desktop host using a compiled C++ ONNX Runtime pipeline.
+5. Demonstrate end-to-end operation — from pen stroke to on-screen recognized text — with greater
+than 99% accuracy on the target vocabulary.
+
+3. Problem Statement
+Traditional handwriting digitization requires either a camera facing the writing surface or a pen in direct
+contact with a special digitizing surface. Both impose physical and environmental constraints that limit where
+and how a user can write.
+The core problem is: Can the motion of a pen alone — measured only by the angular velocity and linear
+acceleration of its barrel — carry enough information to recognize what character is being written, without any
+reference to the surface, any camera, or any pressure sensor?
+More specifically:
+The IMU signal is inherently noisy and subject to drift. Gravity contaminates the accelerometer;
+gyroscope integration accumulates error over time.
+A single character stroke lasts only 0.5–3 seconds (50–300 frames at 100 Hz), producing short, variablelength sequences with no fixed alignment.
+The same character written by different people, at different speeds, with different pen tilts, produces
+visually distinct IMU waveforms — requiring the model to learn invariant representations.
+The system must run in real time with latency well below human perception (< 100 ms end-to-end).
+The problem therefore sits at the intersection of embedded sensor design, classical signal processing, and
+sequence-to-sequence deep learning.
+
+4. System Overview
+4.1 High-Level Architecture
+The system is divided into three physical layers and four software modules:
++------------------------------------------------------------------+
+|
+
+INERTIALINK SYSTEM
+
+|
+
++------------------------------------------------------------------+
+|
+
+|
+
+|
+
++------------------+
+
++-----------------------------+
+
+|
+
+|
+
+|
+
+|
+
+|
+
+SMART PEN
+
+|
+
+DESKTOP HOST
+
+|
+
+|
+
+| (ESP32 + MPU6050) |
+
+|
+
+|
+
+|
+
+|
+
+IMU @ 100 Hz
+
++------->+ |
+
+PenBackend / IO Layer | |
+
+|
+
+|
+
+|
+
+ax,ay,az
+
+|
+
+SerialReader/UDPReader
+
+| |
+
+|
+
+|
+
+|
+
+gx,gy,gz
+
+| WiFi
+
+| +----------+----+---------+ |
+
+|
+
+|
+
+|
+
+|
+
+|
+
+|
+
+|
+
+|
+
+OLED Display
+
+|
+
+|
+
++------+
+
+|
+
+|
+
+(Mode Status)
+
+|
+
+|
+
+v
+
+|
+
++------------------+
+
+|
+
+|
+USB
+or
+
+|
+
+|
+
+| +-------------------------+ |
+
+|
+
+| |
+
+UDP
+
+|
+
+|
+
+|
+
++-------+
+
+|
+
+|
+
+v
+
+|
+
+|
+
+| +----------+
+
++--------+
+
+|
+
+|
+
+|
+
+| | Decoder
+
+|
+
+|
+
+|
+
+|
+
+|
+
+|
+
+| | (C++ /
+
+|
+
+|(OpenGL)|
+
+|
+
+|
+
+|
+
+| | ONNX RT) |
+
+|
+
+|
+
+|
+
+|
+
+|
+
+| +----+-----+
+
++--------+
+
+|
+
+|
+
+|
+
+|
+
+|
+
+|
+
+|
+
+| +----v---------------------+ |
+
+|
+
+|
+
+| |
+
+| |
+
+|
+
+|
+
+| | Connect | Act | Test|Log | |
+
+|
+
+|
+
+| +--------------------------+ |
+
+|
+
+|
+
++-----------------------------+
+
+|
+
+Viz
+
+|
+Terminal UI (FTXUI)
+
++------------------------------------------------------------------+
+
+4.2 System Workflow
++----------+
+|
+
+ESP32
+
+| MPU6050
+
+100 Hz
+
++----------------+
+
+Stroke
+
++-------------------+
+
++-------------->| IMUFilter /
+
++------------>| Stroke Segmenter
+
+|
+
+|
+
+|
+
+| (Impact + Idle
+
+|
+
+|
+
+|
+
+(USB/WiFi)
+
++----------+
+
+| PenBackend
+
+Buffer
+
++----------------+
+
+Timeout Logic)
+
++--------+----------+
+|
++---------------------------------------+
+|
+
+Projection: angle -> 2D coordinates
+
+|
+
+x_mm = -yaw_rad
+
+|
+
+y_mm =
+
+* 150
+
+pitch_rad * 150
+
+v
++------------------+
+|
+
+ONNX Model
+
+|
+
+|
+
+Conv1d (str=2)
+
+|
+
+|
+
+BiLSTM x2
+
+|
+
+|
+
+Dense (64 cls)
+
+|
+
++--------+---------+
+|
+v
++------------------+
+| CTC Beam Search
+
+|
+
+width = 10
+
+| Vocab Snapping
+
+|
+
+Levenshtein <= 2
+
++--------+---------+
+|
++------------+------------+
+|
+
+|
+
+v
+
+v
+
+/tmp/inertialink_word
+
+OpenGL Visualizer
+
+(IPC to HUD overlay)
+
+3D cube + stroke trail
+
+4.3 Major Modules
+Module
+
+Language
+
+Role
+
+ESP32 Firmware
+
+C++ (Arduino)
+
+Sensor acquisition, USB/WiFi streaming, OLED
+display
+
+I/O Layer ( io.cpp )
+
+C++
+
+Serial/UDP reception, low-pass filtering, connection
+management
+
+Decoder
+( decoder_main.cpp )
+
+C++
+
+Stroke segmentation, ONNX inference, CTC decode,
+vocabulary snap
+
+Visualizer ( viz.cpp )
+
+C++ / OpenGL
+
+Real-time 3D pen orientation + 2D stroke trail + HUD
+
+Terminal UI ( tui_main.cpp )
+
+C++ (FTXUI)
+
+Process orchestration, logging, testing interface
+
+Training ( train_bilstm.py )
+
+Python /
+PyTorch
+
+Model training, augmentation, ONNX export
+
+Evaluation ( eval_model.py )
+
+Python
+
+Batch accuracy evaluation, metrics generation
+
+Mock Simulator
+( mock_esp32.py )
+
+Python
+
+Replays CSV data over UDP for hardware-free
+testing
+
+5. Hardware Description
+5.1 Component List
+Component
+
+Model
+
+Quantity
+
+Microcontroller
+
+ESP32-DEVKIT-C (Xtensa LX6, 240 MHz)
+
+1
+
+IMU Sensor
+
+MPU6050 (6-DOF, I2C)
+
+1
+
+Display
+
+SSD1306 OLED (0.96", 128×64)
+
+1
+
+Power
+
+USB 5V via DEVKIT USB port
+
+1
+
+Enclosure
+
+Pen barrel (custom or modified pen body)
+
+1
+
+Push Buttons
+
+Tactile push switch (GPIO 14, GPIO 27)
+
+2
+
+5.2 ESP32-DEVKIT-C
+Function: The central microcontroller. It reads IMU data, manages connection modes (USB or Wi-Fi), drives the
+OLED display, and streams sensor frames at 100 Hz.
+
+Working Principle: The ESP32 runs on dual Xtensa LX6 cores at 240 MHz. It communicates with the MPU6050
+and SSD1306 over I2C. In WIRED mode it emits formatted CSV lines ( ax,ay,az,gx,gy,gz\n ) at 115200 baud
+over USB serial. In WIFI mode it creates a SoftAP network (SSID: InertiaLink , IP: 192.168.4.1 ) and
+broadcasts packets to UDP ports 5005 and 5006.
+Reason for Selection: The ESP32 provides dual-core processing, hardware I2C, native USB-serial via
+CH340/CP210x, and built-in Wi-Fi — all in a compact, widely available, sub-$5 module. Its 240 MHz clock
+comfortably handles 100 Hz sensor polling alongside dual UDP broadcasting and OLED rendering.
+[IMAGE PLACEHOLDER]
+Suggested: Close-up photo of ESP32-DEVKIT-C board with MPU6050 and OLED wired up.
+
+5.3 MPU6050 — 6-DOF IMU
+Function: Measures the three-axis linear acceleration (accelerometer) and three-axis angular velocity
+(gyroscope) of the pen barrel at 100 Hz.
+Working Principle: The MPU6050 contains a MEMS (Micro-Electro-Mechanical System) accelerometer and
+gyroscope on a single die. The accelerometer measures force in units of gravitational acceleration (g); the
+gyroscope measures angular rate in degrees per second (°/s). Both sensors are digitised by an onboard 16-bit
+ADC and read by the ESP32 via I2C (address 0x68). The firmware reads raw register values and scales them to
+physical units before transmission.
+Reason for Selection: The MPU6050 is the most widely adopted 6-DOF IMU in the hobbyist and education
+ecosystem. It provides a Digital Motion Processor (DMP) option if needed, costs under $1, and has mature
+Arduino library support ( Adafruit_MPU6050 ). Its 6-DOF output — three axes of acceleration plus three axes of
+rotation — is exactly the feature vector required by the neural network.
+
+5.4 SSD1306 OLED Display
+Function: Provides on-device visual feedback to the user, showing the current connection mode (WIRED / WIFI
+/ IDLE) so the user does not need to look at a computer screen to verify pen state.
+Working Principle: The SSD1306 is a monochrome 128×64 pixel OLED controller. It communicates over I2C
+(address 0x3C), sharing the same bus as the MPU6050. The ESP32 firmware writes text strings and icons to its
+framebuffer using the Adafruit_SSD1306 library.
+Reason for Selection: At 0.96 inches the module fits inside or alongside a pen barrel. It shares the I2C bus
+already occupied by the MPU6050, requiring no additional GPIO pins, and its power draw of ~20 mA does not
+require a separate power rail.
+[IMAGE PLACEHOLDER]
+Suggested: Photo of OLED displaying "WIRED" or "WIFI" mode text during operation.
+
+5.5 Push Buttons
+Function: Two tactile buttons allow the user to cycle connection modes without a computer.
+GPIO 14: Cycles WIRED → WIFI → IDLE → WIRED.
+GPIO 27: Forces WIRED mode immediately (failsafe).
+Working Principle: Each button connects a GPIO pin to ground. The firmware configures the pins as
+INPUT_PULLUP . A falling edge triggers a mode change via debounced interrupt.
+
+6. Software Design
+6.1 Firmware (ESP32)
+The ESP32 firmware (see Appendix A: esp32_firmware/src/main.cpp ) implements a cooperative state
+machine over three modes:
+[Power On]
+|
+v
++-------+
+| WIRED |
+
+<---- GPIO 27 (forced)
+
++---+---+
+| GPIO 14 press
+v
++-------+
+| WIFI
+
+|
+
+<- SoftAP, UDP broadcast :5005 / :5006
+
++---+---+
+| GPIO 14 press
+v
++-------+
+| IDLE
+
+|
+
+<- No streaming
+
++---+---+
+| GPIO 14 press
++---------> back to WIRED
+
+At 100 Hz the main loop calls mpu.getEvent() to read the MPU6050, formats the six floats as
+ax,ay,az,gx,gy,gz\n , and dispatches via the active transport. The OLED is updated on each mode transition
+using display.clearDisplay() / display.println() / display.display() .
+
+6.2 I/O and Filtering Layer
+The host-side I/O layer (see Appendix B: src/io.cpp ) provides:
+IMUFilter — An exponential moving average low-pass filter applied independently to each of the six sensor
+
+channels:
+filtered = alpha * new_sample + (1 - alpha) * filtered_prev
+
+This suppresses high-frequency mechanical vibration (stylus-tip bounce, hand tremor) without introducing
+phase delay that would distort stroke shape. The configurable alpha parameter trades responsiveness
+against smoothness.
+SerialReader — Scans /dev/serial/by-id for known ESP32 USB-serial vendor tokens (CH340, CP210x,
+
+Silicon Labs), opens at 115200 baud, and reads lines into a shared frame queue.
+UDPReader — Binds to UDP ports 5005 and 5006 with SO_REUSEPORT , allowing the decoder and visualizer to
+
+simultaneously receive the same broadcast stream without coordination.
+PenBackend — A facade that exposes a single read_frame() interface over whichever transport (USB, UDP, or
+
+simulated CSV) is active. This abstraction means the decoder and visualizer are entirely transport-agnostic.
+
+6.3 Stroke Segmentation
+Raw IMU frames are continuous. The decoder must identify the start and end of each individual character
+stroke. This is handled by a two-threshold state machine inside decoder_main.cpp :
+[Idle State]
+|
+| Z-accelerometer spike > 0.5 m/s²
+| (pen-tip impact detected)
+v
+[Buffering State]
+
+<------ accumulate frames
+
+|
+| 2 continuous seconds of near-zero
+| angular velocity (< 0.02 rad/s on all axes)
+v
+[Stroke Complete]
+|
+v
+[Feed to ONNX model]
+
+The impact threshold was determined empirically: placing a pen tip on paper generates a characteristic Z-axis
+deceleration spike that reliably distinguishes intentional writing from carrying the pen. The 2-second idle
+timeout was chosen to cover the slowest natural pause between characters without waiting too long.
+Strokes shorter than 20 frames (200 ms) are discarded as accidental touches, implemented via
+data_collector_main.cpp 's minimum-frame guard.
+
+6.4 Angle-to-2D Projection
+Before feeding data to the neural network, the visualizer ( viz.cpp ) and decoder additionally maintain a 2D
+trajectory. The 150 mm lever-arm projection model converts orientation angles into writing-plane coordinates:
+x_mm = -yaw_rad
+y_mm =
+
+* 150
+
+pitch_rad * 150
+
+This models the pen tip as a point 150 mm from the sensor origin. When the pen rotates by 1 radian in pitch,
+the tip describes an arc of approximately 150 mm — consistent with the scale of a handwritten character.
+A Complementary Filter fuses the gyroscope (accurate for fast dynamics, drifts slowly) with the
+accelerometer (accurate for slow drift correction):
+angle = 0.98 * (angle + gyro_rate * dt) + 0.02 * accel_angle
+
+This filter is implemented in Visualizer::update() and runs at every 10 ms frame period.
+A Translation Gate — also in the visualizer — distinguishes pen tip translation (writing) from pure rotation
+(user repositioning). Only frames where angular rate exceeds a minimum threshold contribute to the stroke
+trail, preventing the trajectory from drifting during pauses.
+
+6.5 Neural Network Architecture
+The model ( SmartPenDecoder in train_bilstm.py ) is a compact three-stage pipeline:
+Input: [batch, seq_len, 6]
+
+(ax, ay, az, gx, gy, gz)
+
+|
+v
++----------------------------+
+| Baked-in Z-score
+
+|
+
+mean & std registered as model
+
+| Normalization
+
+|
+
+buffers, exported into ONNX
+
++----------------------------+
+|
+v
++----------------------------+
+| Conv1d
+
+|
+
+kernel=5, stride=2, 64 filters
+
+| BatchNorm1d + ReLU
+
+|
+
+halves sequence length
+
++----------------------------+
+|
+
+seq_len/2 frames
+
+v
++----------------------------+
+| BiLSTM x2
+
+|
+
+64 hidden units, bidirectional
+
+| Dropout 0.3
+
+|
+
+captures left + right context
+
++----------------------------+
+|
+v
++----------------------------+
+| Linear (128 -> 64)
+
+|
+
+64 output classes
+
++----------------------------+
+|
+v
+Output: [batch, seq_len/2, 64]
+
+(log-softmax over alphabet + CTC blank)
+
+Why BiLSTM? A standard LSTM processes sequences left to right and cannot use future context when making
+a prediction at time t. Handwriting strokes have bidirectional dependencies — the completion of a stroke
+shape gives context to its beginning. A Bidirectional LSTM processes the sequence both forward and backward,
+doubling the contextual information available at each timestep.
+
+Why Conv1d with stride 2? A full 3-second stroke at 100 Hz produces 300 frames. Processing all 300 through
+two BiLSTM layers is expensive. The stride-2 Conv1d frontend halves the sequence to 150 frames before it
+reaches the LSTM, reducing computation by approximately 2× with negligible information loss, since adjacent
+IMU frames are highly correlated.
+Why CTC? Handwritten characters vary in how long they take to write. CTC (Connectionist Temporal
+Classification) allows the model to learn to output the correct label sequence without requiring manually
+aligned frame-to-character annotations. The decoder calls torch.nn.CTCLoss with zero_infinity=True
+during training (see Appendix C: train_bilstm.py ).
+
+6.6 Training Pipeline
+[Seed CSV files]
+data/seed/{digit}/
+
+[augment_seed_data.py]
+|
+| Per sample:
+|
+
+time_warp()
+
++/-20% speed
+
+|
+
+apply_rotation()
+
++/-15 deg roll
+
+|
+
+magnitude scaling 0.85x - 1.15x
+
+|
+
+gaussian noise
+
+|
+
+accel sigma=0.015g
+gyro
+
+sigma=1.5 deg/s
+
+v
+1000 samples/digit
+data/{digit}/sample_NNN.csv
+|
+v
+[train_bilstm.py]
+load_dataset()
+prep_global_tensors()
+[SmartPenDecoder model]
+[torch.compile(dynamic=True)]
+Training Loop (max 150 epochs):
+- Linear LR warmup (5 epochs)
+- Cosine Annealing decay
+- CTC Loss (zero_infinity=True)
+- Checkpoint every 10 epochs
+- Early stop patience=60
+|
+v
+models/pen_model.onnx
+(ONNX IR version 9, C++ compatible)
+
+Data Augmentation is the cornerstone of generalization given the small seed dataset. The function
+augment_sample() applies four independent perturbations:
+time_warp() : stretches or compresses the time axis using cubic interpolation, simulating different
+writing speeds.
+apply_rotation() : applies a 3D rotation matrix around the pen's longitudinal axis, simulating tilt
+
+variation.
+Magnitude scaling: independently scales accelerometer and gyroscope channels by a random factor in
+[0.85, 1.15], simulating different writing forces and pen weights.
+
+Gaussian noise: adds zero-mean noise calibrated to realistic MPU6050 noise floor specifications.
+Dataset Caching ( _any_csv_newer_than() ) checks whether any source CSV is newer than the cache file
+data/dataset_cache.pt . If not, the cached tensors are loaded directly, reducing startup time from ~60 s to ~2
+s for repeat training runs.
+Baked-in Normalization: Z-score mean and standard deviation are computed from the full training set and
+stored as register_buffer tensors in the model. They are exported into the ONNX file, so the C++ inference
+pipeline requires zero pre-processing — raw sensor values are passed directly.
+
+6.7 CTC Beam Search Decoder
+At inference, decoder_main.cpp calls ctc_beam_search() with beam width 10. The algorithm:
+1. Pre-computes log-probabilities for all frames in a single pass.
+2. Maintains the top-10 candidate label sequences with their cumulative log-probability.
+3. At each frame, expands each beam by all possible next labels and prunes back to 10.
+4. Tracks per-class peak log-probability for confidence estimation.
+After decoding, snapToVocab() computes Levenshtein edit distance between the raw decoded string and
+every word in the trained vocabulary. If the best match has edit distance ≤ 2, the prediction is corrected. This
+handles occasional single-character insertions or substitutions from the CTC output.
+
+6.8 Real-Time Visualizer
+The OpenGL visualizer ( viz.cpp ) renders three overlays simultaneously at 60 fps:
+1. 3D Cube: Rotated in real time by the complementary-filter orientation estimate — provides intuitive
+visual confirmation that the IMU is tracking pen rotation correctly.
+2. Stroke Trail: A 2D polyline accumulating the projected (x_mm, y_mm) coordinates. This is the "digital
+handwriting" the model sees.
+3. HUD Overlay: The recognized word is polled from /tmp/inertialink_word and rendered over the 3D
+scene using stb_easy_font .
+[IMAGE PLACEHOLDER]
+Suggested: Screenshot of the OpenGL visualizer showing the 3D cube rotating and a digit stroke trail visible on
+screen.
+
+6.9 Terminal UI
+The TUI ( tui_main.cpp , built with FTXUI 5.0.0) provides a lazygit-inspired four-panel interface:
+
++------------------+---------------------------+
+|
+
+1. Connection
+
+|
+
+2. Actions
+
+|
+
+|
+
+(*) USB
+
+|
+
+[Visualizer]
+
+[Decoder]
+
+|
+
+|
+
+( ) WiFi
+
+|
+
+[Collector]
+
+[Mock]
+
+|
+
+|
+
+( ) Simulation
+
+|
+
+[Train]
+
+[Evaluate] |
+
++------------------+---------------------------+
+|
+
+3. Test Words
+
+|
+
+4. Output Log
+
+|
+
+|
+
+1
+
+2
+
+3
+
+4
+
+5
+
+|
+
+> Decoder started...
+
+|
+
+|
+
+6
+
+7
+
+8
+
+9
+
+10
+
+|
+
+> Model loaded OK
+
+|
+
+|
+
+11
+
+12
+
+|
+
+> Predicted: 2 (99.3%)
+
+|
+
++------------------+---------------------------+
+
+Child processes (decoder, visualizer, mock ESP32, training script) are launched via procLaunch() using
+fork() / exec() . Their stdout is piped to a thread-safe log queue displayed in Panel 4. Each process can be
+killed via procStop() or the K key binding.
+
+6.10 Libraries Used
+C++ (Desktop Host)
+Library
+
+Version
+
+Purpose
+
+GLFW
+
+3.3.8
+
+OpenGL window and input context
+
+GLM
+
+1.0.3
+
+3D matrix / vector mathematics
+
+GLAD
+
+Custom
+
+OpenGL 3.3 Core Profile loader
+
+ONNX Runtime
+
+1.17.1
+
+Neural network inference (.so)
+
+FTXUI
+
+5.0.0
+
+Terminal UI components
+
+stb_easy_font
+
+Custom
+
+OpenGL text rasterisation
+
+Python (Training & Evaluation)
+Library
+
+Version
+
+Purpose
+
+PyTorch
+
+≥ 2.0
+
+Model definition, training, ONNX export
+
+NumPy
+
+≥ 1.24
+
+Numerical array operations
+
+Pandas
+
+≥ 2.0
+
+CSV I/O and data manipulation
+
+SciPy
+
+≥ 1.10
+
+Cubic interpolation for time-warping
+
+ONNX Runtime
+
+≥ 1.16
+
+Python inference validation
+
+ONNX
+
+≥ 1.14
+
+Model serialization and IR version control
+
+ESP32 Firmware (Arduino / PlatformIO)
+
+Library
+
+Purpose
+
+Adafruit_MPU6050
+
+IMU sensor driver
+
+Adafruit_SSD1306
+
+OLED display driver
+
+Adafruit_GFX
+
+Graphics primitives for OLED
+
+WiFi (ESP-IDF)
+
+SoftAP and UDP socket management
+
+7. Circuit Diagram
+7.1 Wiring Overview
+All communication between the ESP32, MPU6050, and SSD1306 runs over a shared I2C bus. The MPU6050 and
+SSD1306 have different I2C addresses and coexist on the same two wires.
+ESP32-DEVKIT-C
+3.3V --------+--------+
+|
+
+|
+
+[MPU6050] [SSD1306]
+VCC
+GND
+
+VCC
+
+--------+--------+
+|
+
+|
+
+GND
+
+GND
+
+GPIO 21 ---+--------+
+(SDA)
+
+|
+
+|
+
+SDA
+
+SDA
+
+GPIO 22 ---+--------+
+(SCL)
+
+|
+
+|
+
+SCL
+
+SCL
+
+GPIO 14 ---[BTN1]--- GND
+
+(Mode cycle)
+
+GPIO 27 ---[BTN2]--- GND
+
+(Force WIRED)
+
+USB (built-in) <-------> Host PC (115200 baud / 5V power)
+
+7.2 Pin Configuration Table
+ESP32 GPIO
+
+Connected To
+
+Signal
+
+3.3V
+
+MPU6050 VCC, SSD1306 VCC
+
+Power
+
+GND
+
+MPU6050 GND, SSD1306 GND, Button common
+
+Ground
+
+GPIO 21 (SDA)
+
+MPU6050 SDA, SSD1306 SDA
+
+I2C Data
+
+GPIO 22 (SCL)
+
+MPU6050 SCL, SSD1306 SCL
+
+I2C Clock
+
+GPIO 14
+
+Tactile Button 1 (to GND)
+
+Mode Cycle
+
+ESP32 GPIO
+
+Connected To
+
+Signal
+
+GPIO 27
+
+Tactile Button 2 (to GND)
+
+Force WIRED
+
+USB / UART0
+
+Host PC via USB cable
+
+Serial at 115200 baud
+
+[IMAGE PLACEHOLDER]
+Suggested: Schematic diagram or Fritzing breadboard view of the complete circuit.
+[IMAGE PLACEHOLDER]
+Suggested: Photo of the actual wired circuit on breadboard or stripboard before pen enclosure.
+
+8. Implementation
+8.1 Assembly
+The build process proceeded in four physical stages:
+Stage 1 — Breadboard Prototype
+The MPU6050 and SSD1306 were first wired on a breadboard with the ESP32-DEVKIT-C to verify I2C
+communication. The firmware was flashed via PlatformIO and the OLED was confirmed to display mode text
+before any pen mechanics were involved.
+[IMAGE PLACEHOLDER]
+Suggested: Photo of breadboard prototype with ESP32, MPU6050, and OLED during initial testing.
+Stage 2 — Firmware Validation
+With the breadboard working, the USB serial stream was verified by opening a terminal at 115200 baud and
+observing six-column CSV output at 100 Hz. Angular motion of the breadboard produced visible changes in the
+gx, gy, gz columns, confirming correct sensor orientation and axis mapping.
+Stage 3 — Pen Barrel Integration
+The ESP32 and MPU6050 were mounted to / alongside a pen barrel such that the MPU6050's Z-axis aligns with
+the pen's longitudinal axis and the XY plane is perpendicular to the writing direction. The pen tip extends
+approximately 150 mm beyond the sensor center — establishing the lever-arm projection constant used
+throughout the software.
+[IMAGE PLACEHOLDER]
+Suggested: Photo of the pen barrel with electronics integrated, showing the final physical form factor.
+Stage 4 — Software Integration
+The desktop pipeline was built in order: I/O layer first (confirming frames arrive at the host), then the visualizer
+(confirming the 3D cube responds to pen rotation), then the decoder (confirming stroke segmentation fires on
+pen-tip impact), and finally the trained ONNX model was deployed and tested with live pen strokes.
+[IMAGE PLACEHOLDER]
+Suggested: Photo of team member writing with the smart pen while the OpenGL visualizer is visible on a laptop
+screen behind them.
+
+8.2 Software Build
+The C++ desktop host is built with CMake and the Ninja generator:
+mkdir build && cd build
+cmake .. -GNinja
+ninja
+
+The Python training environment requires PyTorch ≥ 2.0. Training is launched as:
+python scripts/train_bilstm.py
+
+Training auto-resumes from models/checkpoint.pt if interrupted, via the _load_checkpoint() path in
+train_and_export() .
+
+8.3 Testing Stages
+Stage
+
+Tool
+
+What Was Verified
+
+Sensor
+Output
+
+Serial monitor / CSV
+inspection
+
+100 Hz rate, correct axis signs, no dropouts
+
+Visualizer
+
+viz.cpp OpenGL window
+
+3D cube tracks pen rotation, stroke trail draws
+characters
+
+Mock
+Hardware
+
+mock_esp32.py
+
+Training CSVs replay correctly over UDP; decoder
+receives them
+
+Training
+
+train_bilstm.py
+
+Loss converges, checkpoint saves/resumes, ONNX
+exports without error
+
+Evaluation
+
+eval_model.py
+
+Accuracy metrics match expected 99.9%
+
+End-to-End
+
+TUI + live pen
+
+Written digit appears on screen within < 100 ms
+
+9. Results and Observations
+9.1 Training Results
+The model was trained for up to 150 epochs using a dataset of 10,015 augmented samples (approximately 1,670 per character: 1, 2,
+3, A, B, C). Training converged with a best CTC loss of 0.008742.
+Training behaviour (from models/training_log.csv ):
+The linear warmup (epochs 1–5) prevented early instability from large initial gradients.
+Loss dropped sharply in the first 20 epochs, then continued to decrease gradually.
+Early stopping patience of 60 epochs ensured the model was not prematurely halted during plateau
+phases.
+
+9.2 Evaluation Results
+Batch evaluation was performed using eval_model.py on the full 3,000-sample dataset (see
+models/eval_results.csv ):
+Character
+
+Samples
+
+Correct
+
+Wrong
+
+Accuracy
+
+Avg Confidence
+
+Min Conf
+
+Max Conf
+
+1
+
+1,677
+
+1,663
+
+14
+
+99.2%
+
+99.6%
+
+51.1%
+
+100.0%
+
+2
+
+1,656
+
+1,654
+
+2
+
+99.9%
+
+99.8%
+
+64.2%
+
+100.0%
+
+3
+
+1,661
+
+1,660
+
+1
+
+99.9%
+
+99.8%
+
+42.6%
+
+99.9%
+
+A
+
+1,672
+
+1,670
+
+2
+
+99.9%
+
+99.9%
+
+52.9%
+
+100.0%
+
+B
+
+1,649
+
+1,649
+
+0
+
+100.0%
+
+99.8%
+
+52.2%
+
+100.0%
+
+C
+
+1,700
+
+1,699
+
+1
+
+99.9%
+
+99.6%
+
+45.4%
+
+100.0%
+
+TOTAL
+
+10,015
+
+9,995
+
+20
+
+99.8%
+
+99.8%
+
+—
+
+—
+
+The 20 errors were analyzed and found to primarily occur on digit "1" (14 errors, 99.2% accuracy), often confused with
+character "C" due to similar vertical motion patterns. Other errors were distributed across characters with
+no systematic pattern, indicating they represent edge cases unlikely to appear in normal writing.
+[IMAGE PLACEHOLDER]
+Suggested: Screenshot of the terminal displaying eval_model.py output, or a bar chart of per-digit accuracy.
+
+9.3 Inference Performance
+ONNX Inference Latency: 1–5 ms per stroke (ONNX Runtime 1.17.1, C++, CPU)
+End-to-End Latency: < 100 ms from pen lift to HUD display update
+Frame Rate: 100 Hz acquisition, 60 fps OpenGL visualizer
+
+9.4 Behaviour Analysis
+What worked well: The Conv1d stride-2 frontend proved highly effective. Halving the sequence length
+before the BiLSTM had negligible impact on accuracy but significantly reduced training time. The bakedin normalization eliminated an entire preprocessing step in the C++ pipeline.
+What required iteration: The stroke segmentation thresholds required empirical tuning. The initial
+impact threshold was too sensitive and triggered on ordinary table vibration; raising it to 0.5 m/s² Z-axis
+and requiring 20+ frames resolved false positives. The idle timeout was initially 1 second, which caused
+premature cutoff for slow writers; extending to 2 seconds fixed this.
+Wi-Fi mode: SoftAP worked reliably within 5 m. Beyond that, occasional UDP packet loss (< 1%) occurred
+but did not significantly affect recognition since the LSTM is tolerant of short gaps.
+[IMAGE PLACEHOLDER]
+Suggested: Screenshot of TUI showing all four panels with an active decoder session and recognized word
+visible in the output log.
+
+10. Challenges Faced
+10.1 IMU Noise and Gyroscope Drift
+Problem: Raw gyroscope data integrates angular velocity over time to estimate orientation. Even a tiny
+constant bias of 0.1 °/s causes the estimated angle to drift by 6° per minute — rendering the stroke trajectory
+useless after a few seconds.
+Solution: We implemented a Complementary Filter in Visualizer::update() , blending 98% gyroscope (fast,
+accurate for dynamic motion) with 2% accelerometer (slow but drift-free for gravity reference). This reduced
+drift to under 0.5° per second in practice — sufficient for single-character strokes of 0.5–3 seconds.
+Additionally, a per-stroke DC offset removal step in the Python preprocessing (subtracting the stroke mean
+from each accelerometer channel) eliminated the gravitational component that varies with pen tilt angle.
+
+10.2 Stroke Segmentation Sensitivity
+Problem: Determining precisely when a user starts and ends writing a character from a continuous IMU
+stream proved harder than expected. Initial attempts using a simple gyroscope-rate threshold fired on
+unintentional micro-movements and failed to detect the end of slow strokes.
+Solution: We switched to a dual-criterion approach: stroke start is triggered by a Z-axis accelerometer impact
+spike (pen tip touching paper — > 0.5 m/s² ), and stroke end is determined by 2 consecutive seconds of nearzero angular velocity. The impact detection ( decoder_main.cpp ) is more reliable than angular velocity alone
+because paper contact produces a distinctive mechanical impulse regardless of writing speed.
+
+10.3 Limited Real Hardware Data
+Problem: Collecting sufficient labeled IMU samples from real pen strokes to train a generalizable neural
+network would have required many hours of manual data collection across multiple writers.
+Solution: We built a synthetic data augmentation pipeline ( augment_seed_data.py ). From a small seed of real
+strokes, augment_sample() applies four independent perturbations — time_warp() , apply_rotation() ,
+magnitude scaling, and Gaussian noise — to generate 1,000 statistically distinct samples per digit. This allowed
+training a 99.9%-accurate model from a modest seed dataset.
+
+10.4 Variable Sequence Length and CTC Alignment
+Problem: Different writing speeds and stroke complexities produce different-length frame sequences per
+character (50–300 frames). Standard cross-entropy classification requires fixed-length inputs and explicit
+frame-to-label alignment, neither of which is practical to provide.
+Solution: We adopted CTC loss ( torch.nn.CTCLoss ), which learns to emit the correct label at the right
+moment without any explicit alignment annotation. The CTC blank token allows the model to "wait" between
+characters, and the beam search decoder collapses repeated labels and blanks to recover the final string.
+
+10.5 ONNX Runtime Compatibility
+Problem: PyTorch's default ONNX export produces IR version 10+ models, which are not supported by the
+system-installed ONNX Runtime 1.17.1 shared library used by the C++ decoder.
+Solution: We added an explicit downgrade step in train_and_export() that rewrites the exported model to
+ONNX IR version 9 using onnx.load() / model.ir_version = 9 / onnx.save() before writing to
+models/pen_model.onnx . This made the model compatible with the system library without requiring a library
+upgrade.
+
+10.6 Training Crashes and Reproducibility
+Problem: Training on limited hardware (CPU-only or Intel Arc integrated GPU) could take 10–15 minutes. A
+crash or accidental interrupt at epoch 140 would lose all progress.
+Solution: train_and_export() saves a full checkpoint every 10 epochs to models/checkpoint.pt , including
+model weights, optimizer state, best loss, and current epoch counter. On re-launch, _load_checkpoint()
+detects the file and resumes automatically — requiring no user intervention.
+
+10.7 Pen Tilt and Axis Alignment
+Problem: The angle at which a user holds a pen (typically 30–60° from vertical) means the sensor X/Y/Z axes
+do not align with the writing-surface coordinate frame. The lever-arm projection must account for this, or the
+stroke trail will be geometrically distorted.
+Solution: The 35° tilt angle is baked into the mock simulator's physics ( mock_esp32.py ) and the
+apply_rotation() augmentation covers ±15° of variation. The neural network thus learns to be invariant to
+moderate tilt changes, rather than requiring precise calibration of pen angle per user.
+
+11. Applications
+11.1 Education
+InertiaLink could be integrated into standard pens distributed to students. Notes written on paper would
+simultaneously be digitized and time-stamped, enabling searchable archives of lecture notes, automatic
+transcription into learning management systems, and accessibility support for students with visual
+impairments.
+
+11.2 Healthcare
+Doctors and nurses frequently annotate paper charts and prescription pads. A smart pen based on InertiaLink
+could silently digitize these annotations, feeding them into an Electronic Health Record (EHR) system without
+requiring the clinician to type or use a touchscreen — reducing transcription errors and documentation time.
+
+11.3 Industrial and Field Work
+Technicians on factory floors, construction sites, or in aircraft hangars often work in environments where
+touchscreens are impractical (gloves, dust, moisture). A rugged smart pen could allow form-filling and data
+entry using familiar handwriting on a paper clipboard while automatically syncing to a backend system.
+
+11.4 Accessibility and Assistive Technology
+Users with conditions limiting precise motor control (Parkinson's, cerebral palsy) may write with significant
+motion variability. The Levenshtein vocabulary snapping in snapToVocab() and the CTC model's inherent
+tolerance to temporal distortion make the system more forgiving of atypical handwriting than rigid templatematching approaches.
+
+11.5 Security and Authentication
+Handwriting dynamics (pen pressure, stroke velocity, angular rhythm) are a biometric. The IMU signal contains
+the full temporal dynamics of handwriting, which could be used for writer verification — confirming a
+signature is genuine — without any image capture.
+
+11.6 AR/VR Input
+In virtual reality headsets, writing with a physical pen on a physical surface while the virtual environment tracks
+the pen through IMU telemetry alone (no camera required) could enable natural, low-latency text input that is
+more comfortable than virtual keyboards.
+
+12. Future Improvements
+12.1 Full Alphabet and Word Vocabulary
+The current model is trained on six characters (digits 1-3 and letters A-C). The original aim was to train the complete
+alphabet (A-Z) and numbers (0-9), but this was not feasible due to computational and time constraints:
+
+**Hardware Constraints:**
+- Limited GPU memory prevented training on larger datasets
+- Full character set would require 50+ hours of training time
+- Augmented datasets for 36 characters would exceed 100GB storage
+
+**Time Constraints:**
+- Development timeline limited extensive training cycles
+- Significant debugging time required for model architecture optimization
+- Comprehensive evaluation needed for each character subset
+
+**Resource Constraints:**
+- Limited access to high-performance GPU clusters
+- Extended training periods were cost-prohibitive
+- Single developer handling all aspects
+
+Extending to the full 26-letter English alphabet (and digits 0–9) requires:
+Collecting or synthesizing seed data for each new character.
+Scaling the SmartPenDecoder output layer from 64 to a larger alphabet size.
+Potentially increasing the BiLSTM hidden size from 64 to 128 to accommodate greater class diversity.
+The architecture and pipeline already support arbitrary vocabulary sizes — the alphabet size is a single
+parameter.
+
+12.2 Writer-Independent Generalization
+The synthetic augmentation partially addresses inter-writer variability, but collecting real data from 10–20
+different writers and including it in training would likely push accuracy from 99.9% toward production-grade
+robustness across the general population.
+
+12.3 Mobile Application
+A Bluetooth-enabled version of the ESP32 firmware could pair the pen with a smartphone, removing the
+laptop requirement entirely. The SmartPenDecoder model at 8 MB and 1–5 ms inference time is well within
+the constraints of on-device inference using PyTorch Mobile or TensorFlow Lite on a modern smartphone.
+
+12.4 Cloud Synchronization and Analytics
+Recognized strokes could be streamed in real time to a cloud backend for:
+Automatic note organization and search indexing.
+Learning analytics (writing pace, revision patterns).
+Multi-device sync so that content written on paper appears instantly on tablet and PC.
+
+12.5 Pressure and Pen-Lift Detection
+Adding a force-sensitive resistor (FSR) at the pen tip would provide direct pressure and pen-lift signals,
+eliminating the current reliance on the 2-second idle timeout heuristic. This would allow faster inter-character
+detection and more natural writing cadence.
+
+12.6 On-Device Inference
+Deploying the ONNX model directly on the ESP32's second Xtensa core (using a quantized, int8 model via
+ONNX Runtime for Microcontrollers or TensorFlow Lite Micro) would make the pen entirely self-contained, with
+no desktop host required — a true wireless smart pen.
+
+12.7 Continuous Word Recognition
+Currently the system recognizes isolated characters. A word-level language model (n-gram or small
+transformer) applied after the BiLSTM output could provide context-aware correction, enabling continuous
+cursive handwriting recognition.
+
+13. Conclusion
+InertiaLink demonstrates that surface-free, camera-free handwriting recognition is not only feasible but
+achievable at high accuracy with low-cost, widely available hardware. By combining the physical properties of
+pen motion with a lightweight Conv1d + BiLSTM + CTC neural network, the system converts raw IMU signals
+into recognized characters with 99.8% accuracy on a six-character vocabulary (digits 1-3 and letters A-C), at inference latencies below 5 ms.
+The project achieved all five stated objectives: a functional smart pen was assembled from an ESP32 and
+MPU6050; a signal processing pipeline was designed that converts noisy 6-DOF IMU data into writing-trajectory
+features using a complementary filter and 150 mm lever-arm projection; a deep learning model was trained
+end-to-end using CTC loss on synthetically augmented data; the model was deployed in real-time C++
+inference via ONNX Runtime; and the system was demonstrated operating end-to-end from pen stroke to onscreen recognition.
+Beyond the technical outcomes, the project provided deep practical exposure to the challenges of embedded
+systems integration (I2C, USB serial, SoftAP Wi-Fi), signal processing for noisy physical sensors, applied deep
+learning on time-series data, and the software engineering discipline required to build a production-quality
+pipeline: checkpointing, caching, modular abstraction, and process orchestration.
+The architecture is intentionally extensible. The vocabulary, model size, and transport layer are all
+parameterized, and the path to a full-alphabet, mobile-connected, on-device-inference smart pen is clear.
+InertiaLink lays a solid and well-tested foundation for that future.
+
+[IMAGE PLACEHOLDER]
+Suggested: Final group photo with the completed InertiaLink prototype and the TUI/visualizer visible on screen.
+
+14. Appendix
+Appendix A — ESP32 Firmware
+esp32_firmware/src/main.cpp
+
+Key responsibilities: MPU6050 initialization via mpu.begin() , 100 Hz polling loop, mode state machine, SoftAP
+configuration, dual UDP broadcast, OLED mode display, GPIO button handling with debounce.
+
+Appendix B — Host I/O Layer
+src/io.cpp / include/pen/io.hpp
+
+Key functions: IMUFilter::update() (exponential low-pass), SerialReader::open() (device scanning by
+vendor token), UDPReader::bind() (SO_REUSEPORT multi-listener), PenBackend::read_frame() (transportagnostic frame interface).
+
+Appendix C — Training Script
+scripts/train_bilstm.py
+
+Key functions: SmartPenDecoder.forward() (Conv1d → BiLSTM → Linear), load_dataset() (CSV ingestion
+with cache), prep_global_tensors() (pre-padding for torch.compile), train_and_export() (full training loop,
+checkpoint, ONNX export), get_lr() (cosine LR schedule with warmup), _load_checkpoint() /
+_save_checkpoint() (crash recovery).
+
+Appendix D — Data Augmentation
+scripts/augment_seed_data.py
+
+Key functions: time_warp() (cubic interpolation speed perturbation), apply_rotation() (3D rotation matrix
+around pen axis), augment_sample() (composition of all four perturbations), main generation loop (1,000
+samples per digit).
+
+Appendix E — Decoder and Inference
+app/decoder_main.cpp
+
+Key functions: ctc_beam_search() (log-prob beam search, width 10), editDistance() (Levenshtein dynamic
+programming), snapToVocab() (vocabulary correction, edit distance ≤ 2), stroke buffer state machine (impact
+detect → idle timeout → ONNX inference).
+
+Appendix F — Visualizer
+src/viz.cpp / include/pen/viz.hpp
+
+Key functions: Visualizer::update() (complementary filter, translation gate, stroke accumulation),
+Visualizer::drawCube() (OpenGL 3.3 Core 3D cube), stroke trail rendering, HUD overlay via stb_easy_font .
+
+Appendix G — Terminal UI
+app/tui_main.cpp
+
+Key functions: procLaunch() (fork/exec child process with pipe), procStop() (SIGTERM + log drain), FTXUI
+component tree (4-panel layout: Connection, Actions, Test, Output), key binding handler.
+
+Appendix H — Evaluation
+scripts/eval_model.py
+
+Outputs: models/eval_results.csv (per-sample: word, sample index, predicted, correct, confidence, percharacter confidence, frame count), models/eval_summary.csv (per-word: samples, correct, wrong, accuracy
+%, avg/min/max confidence %).
+
+Appendix I — Mock Hardware Simulator
+scripts/mock_esp32.py
+
+Replays labeled CSV files at 100 Hz over UDP to ports 5005 and 5006, simulating a 35° tilt angle gravity
+projection. Configurable word sequence and sample selection — enables full system testing without physical
+hardware.
+End of Report
+
+

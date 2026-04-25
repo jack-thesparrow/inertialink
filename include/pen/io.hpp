@@ -113,6 +113,7 @@ public:
   bool getLatestData(IMUData &data);
   std::string getStatus() const;
   ConnectionMode getMode() const { return currentMode; }
+  void sendCommand(const std::string &cmd);
 
   // connectUSB: opens the port and immediately sends "MODE:USB\n" so the
   // firmware starts streaming regardless of its current state.

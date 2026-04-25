@@ -45,12 +45,25 @@ fi
 # - Pass /dev/dri for GPU access
 # - --ipc=host improves shared-memory throughput during training
 echo "[inertialink] Starting training container on Intel Arc GPU..."
-docker run --rm -it \
+TTY_FLAGS=""
+if [ -t 0 ] && [ -t 1 ]; then
+    TTY_FLAGS="-it"
+fi
+docker run --rm $TTY_FLAGS \
     --device=/dev/dri \
     -v /dev/dri/by-path:/dev/dri/by-path \
     $GROUP_FLAGS \
     --ipc=host \
     -v "$PROJECT_DIR":/workspace \
     -w /workspace \
+    -e TRAIN_GPU_FAST \
+    -e TRAIN_BATCH_SIZE \
+    -e TRAIN_FROM_SCRATCH \
+    -e TRAIN_VAL_EVERY \
+    -e TRAIN_VAL_METRICS_EVERY \
+    -e TRAIN_EPOCHS \
+    -e TRAIN_EMA_DECAY \
+    -e TRAIN_FORCE_COMPILE \
+    -e TRAIN_DISABLE_COMPILE \
     "$IMAGE_NAME" \
     "$@"

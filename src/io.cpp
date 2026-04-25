@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <termios.h>
@@ -226,6 +227,16 @@ bool PenBackend::getLatestData(IMUData &data) {
 }
 
 std::string PenBackend::getStatus() const { return currentStatus; }
+
+void PenBackend::sendCommand(const std::string &cmd) {
+  if (!activeReader)
+    return;
+  if (currentMode != ConnectionMode::USB &&
+      currentMode != ConnectionMode::Bluetooth)
+    return;
+  if (auto *serial = dynamic_cast<SerialReader *>(activeReader.get()))
+    serial->sendCommand(cmd);
+}
 
 void PenBackend::connectUSB(const std::string &port) {
   const std::string resolvedPort = device::resolveEsp32Port(port);
