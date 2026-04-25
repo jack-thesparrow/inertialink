@@ -64,8 +64,8 @@ The InertiaLink system consists of three major layers: data acquisition on the s
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
-> 📷 **[INSERT IMAGE — Figure 1: System architecture block diagram]**
-> *End-to-end pipeline: Smart Pen → Preprocessing → Inference → Output Display*
+![Figure 1: System architecture block diagram](report_figures/figure1_system_architecture.png)
+*Figure 1: End-to-end pipeline — Smart Pen → Preprocessing → Inference → Output Display*
 
 ### 3.2 System Workflow
 
@@ -91,8 +91,8 @@ The workflow proceeds in six stages:
 5. CTC beam-search decoding converts model logits to a character prediction with a confidence score.
 6. The recognized character is displayed to the user with sub-100 ms total latency.
 
-> 📷 **[INSERT IMAGE — Figure 2: Software pipeline flowchart]**
-> *Detailed flowchart of the 6-stage processing pipeline*
+![Figure 2: Software pipeline flowchart](report_figures/figure2_software_pipeline.png)
+*Figure 2: Detailed flowchart of the 6-stage processing pipeline*
 
 ### 3.3 Major Modules
 
@@ -119,8 +119,8 @@ The workflow proceeds in six stages:
 | BLE/Wi-Fi Module | Data transmission to edge device | Integrated in ESP32, low latency |
 | Edge Device (PC/SBC) | Neural network inference | Sufficient compute for real-time BiLSTM |
 
-> 📷 **[INSERT IMAGE — Figure 3: Hardware prototype photo]**
-> *Photo of the smart pen prototype with labeled components*
+![Figure 3: Hardware prototype photo](report_figures/figure3_hardware_prototype.png)
+*Figure 3: Smart pen prototype with labeled components*
 
 ### 4.2 Working Principles
 
@@ -142,13 +142,13 @@ InertiaLink uses a **Connectionist Temporal Classification (CTC)** framework. CT
 - **Linear projection:** Maps 512-dimensional LSTM output to 7 output classes (6 characters + blank).
 - **Dropout regularization:** Applied between layers to prevent overfitting.
 
-> 📷 **[INSERT IMAGE — Figure 4: Model architecture diagram]**
-> *Visual diagram of Conv1D → BiLSTM → Linear layers with input/output dimensions labeled*
+![Figure 4: Model architecture diagram](report_figures/figure4_model_architecture.png)
+*Figure 4: Conv1D → BiLSTM → Linear layers with input/output dimensions*
 
 ### 5.3 Preprocessing Flowchart
 
-> 📷 **[INSERT IMAGE — Figure 5: Preprocessing flowchart]**
-> *Step-by-step flowchart: Raw IMU → Gravity Removal → High-pass Filter → Normalize → Model Input*
+![Figure 5: Preprocessing flowchart](report_figures/figure5_preprocessing_flowchart.png)
+*Figure 5: Raw IMU → Gravity Removal → High-pass Filter → Normalize → Model Input*
 
 ### 5.4 Key Code Structure
 
@@ -210,8 +210,8 @@ To expand the dataset to 1,500+ samples per character, the following augmentatio
 - **Rotation simulation** — Applies virtual rotation to the accelerometer axes.
 - **Velocity scaling** — Uniformly scales the magnitude of sensor readings.
 
-> 📷 **[INSERT IMAGE — Figure 6: Augmentation examples]**
-> *Side-by-side plots: original vs. time-warped vs. noise-injected sensor signal for character '1'*
+![Figure 6: Augmentation examples](report_figures/figure6_augmentation_examples.png)
+*Figure 6: Original vs. time-warped vs. noise-injected sensor signal for character '1'*
 
 ### 6.4 Dataset Split
 
@@ -221,8 +221,8 @@ To expand the dataset to 1,500+ samples per character, the following augmentatio
 | Validation | ~2,003 | 20% |
 | **Total** | **10,015** | **100%** |
 
-> 📷 **[INSERT IMAGE — Figure 7: Dataset distribution chart]**
-> *Bar chart showing sample counts per character across train/validation splits*
+![Figure 7: Dataset distribution chart](report_figures/figure7_dataset_distribution.png)
+*Figure 7: Sample counts per character across train/validation splits*
 
 ---
 
@@ -243,11 +243,11 @@ To expand the dataset to 1,500+ samples per character, the following augmentatio
 
 ### 7.2 Training Curves
 
-> 📷 **[INSERT IMAGE — Figure 8: Training & validation loss curves]**
-> *Line plots of CTC training loss and validation loss over 150 epochs*
+![Figure 8: Training and validation loss curves](report_figures/figure8_training_curves.png)
+*Figure 8: CTC training loss and validation loss over 150 epochs*
 
-> 📷 **[INSERT IMAGE — Figure 9: Validation accuracy curve]**
-> *Line plot of per-epoch validation accuracy, showing convergence toward 99.8%*
+![Figure 9: Validation accuracy curve](report_figures/figure9_accuracy_curve.png)
+*Figure 9: Per-epoch validation accuracy converging toward 99.8%*
 
 ### 7.3 Hardware Acceleration
 
@@ -280,16 +280,16 @@ To expand the dataset to 1,500+ samples per character, the following augmentatio
 | **C** | 1,700 | 1,699 | 1 | 99.9 | 99.6 | 45.4 | 100.0 |
 | **TOTAL** | **10,015** | **9,995** | **20** | **99.8** | **99.8** | — | — |
 
-> 📷 **[INSERT IMAGE — Figure 10: Per-character accuracy bar chart]**
-> *Grouped bar chart comparing accuracy and average confidence per character*
+![Figure 10: Per-character accuracy bar chart](report_figures/figure10_per_character_accuracy.png)
+*Figure 10: Accuracy and average confidence per character*
 
-> 📷 **[INSERT IMAGE — Figure 11: Confidence score distribution]**
-> *Box plot or violin plot of confidence score distributions per character (min, median, max)*
+![Figure 11: Confidence score distribution](report_figures/figure11_confidence_distribution.png)
+*Figure 11: Confidence score distributions per character (min, median, max)*
 
 ### 8.2 Confusion Matrix
 
-> 📷 **[INSERT IMAGE — Figure 12: Confusion matrix]**
-> *6×6 heatmap showing predicted vs. true character labels across all 10,015 test samples*
+![Figure 12: Confusion matrix](report_figures/figure12_confusion_matrix.png)
+*Figure 12: 6×6 heatmap of predicted vs. true labels across all 10,015 test samples*
 
 ### 8.3 Error Analysis
 
@@ -302,8 +302,8 @@ All 20 errors originate from the digit **'1'**, which is the most challenging ch
 | 3 | 2 | 10% | Similar ending stroke pattern |
 | Other | 7 | 35% | Low-confidence edge cases (< 60% conf.) |
 
-> 📷 **[INSERT IMAGE — Figure 13: Error analysis chart]**
-> *Bar chart of misclassification types for character '1'; optionally with annotated sensor signal overlays comparing '1' vs. 'C'*
+![Figure 13: Error analysis chart](report_figures/figure13_error_analysis.png)
+*Figure 13: Misclassification breakdown for character '1' with sensor signal overlays*
 
 ### 8.4 Inference Performance
 
@@ -314,8 +314,8 @@ All 20 errors originate from the digit **'1'**, which is the most challenging ch
 | XPU (Arc A770) | 18 ms | 10 MB | 8 W |
 | MCU (ESP32) | 120 ms | 4 MB | 0.05 W |
 
-> 📷 **[INSERT IMAGE — Figure 14: Inference latency comparison chart]**
-> *Grouped bar chart comparing latency and power draw across CPU, GPU, XPU, and MCU platforms*
+![Figure 14: Inference latency comparison](report_figures/figure14_inference_performance.png)
+*Figure 14: Latency and power draw across CPU, GPU, XPU, and MCU platforms*
 
 ---
 
@@ -348,8 +348,8 @@ All 20 errors originate from the digit **'1'**, which is the most challenging ch
 
 The smart pen prototype was assembled by mounting the IMU module and ESP32 on a custom PCB housed within a pen-shaped enclosure. The MCU firmware was written in C++ using the Arduino IDE and the Adafruit MPU6050 library for sensor communication over I2C.
 
-> 📷 **[INSERT IMAGE — Figure 15: Prototype assembly photos]**
-> *Photos of the assembled PCB, pen enclosure, and complete prototype*
+![Figure 15: Prototype assembly photos](report_figures/figure15_prototype_photos.png)
+*Figure 15: Assembled PCB, pen enclosure, and complete prototype*
 
 ### 10.2 Testing Stages
 
@@ -437,8 +437,8 @@ The modular architecture and scalable training pipeline of InertiaLink provide a
 
 ### B. Circuit Diagram and Pin Configuration
 
-> 📷 **[INSERT IMAGE — Figure 16: Circuit / wiring diagram]**
-> *Schematic or Fritzing diagram of IMU-to-ESP32 wiring with labeled pins*
+![Figure 16: Circuit and wiring diagram](report_figures/figure16_circuit_diagram.png)
+*Figure 16: IMU-to-ESP32 wiring schematic with labeled pins*
 
 | IMU Pin | ESP32 Pin | Function |
 |:---:|:---:|---|
@@ -450,11 +450,11 @@ The modular architecture and scalable training pipeline of InertiaLink provide a
 
 ### C. Additional Performance Plots
 
-> 📷 **[INSERT IMAGE — Figure 17: Raw sensor signal traces]**
-> *Multi-panel plot: raw ax, ay, az, gx, gy, gz signals for one sample of each of the 6 characters*
+![Figure 17: Raw sensor signal traces](report_figures/figure17_sensor_signals.png)
+*Figure 17: Raw ax, ay, az, gx, gy, gz signals for one sample of each character*
 
-> 📷 **[INSERT IMAGE — Figure 18: t-SNE feature space visualization]**
-> *t-SNE 2D projection of LSTM-extracted feature embeddings, colored by character class*
+![Figure 18: t-SNE feature space visualization](report_figures/figure18_tsne_visualization.png)
+*Figure 18: t-SNE 2D projection of LSTM feature embeddings colored by character class*
 
 ### D. Training Configuration Reference
 
