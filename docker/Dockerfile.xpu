@@ -2,6 +2,7 @@
 # InertiaLink — Intel Arc GPU (XPU) Training Container
 # Base: Intel's official IPEX 2.8.10 image (Ubuntu 22.04)
 #       Includes: PyTorch 2.8, intel-extension-for-pytorch, Level Zero
+# Enhanced: Time tracking and training progress monitoring
 # ============================================================
 FROM intel/intel-extension-for-pytorch:2.8.10-xpu
 
@@ -14,17 +15,22 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir \
         pandas \
         onnx \
-        onnxruntime \
+        onnxruntime-openvino \
         onnxscript \
         scipy \
         scikit-learn \
         matplotlib \
-        tabulate
+        tabulate \
+        tqdm  # Progress bars
 
 # Copy the full project so scripts can import each other and reach data/
 COPY . .
 
-# Default command: run the training script.
+# Set environment variables for better time tracking
+ENV PYTHONUNBUFFERED=1
+ENV TZ=UTC
+
+# Default command: run the training script with time tracking.
 # Override at runtime, e.g.:
 #   docker run ... inertialink-xpu python scripts/augment_seed_data.py
 CMD ["python", "scripts/train_bilstm.py"]
