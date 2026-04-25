@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  inertialink-xpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.xpu
+    image: inertialink-xpu:latest
+    container_name: inertialink-training
+    volumes:
+      - ./data:/workspace/data
+      - ./models:/workspace/models
+      - ./logs:/workspace/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=UTC
+      # Training configuration
+      - TRAIN_EPOCHS=150
+      - TRAIN_BATCH_SIZE=128
+      - TRAIN_VAL_EVERY=3
+      - TRAIN_PROGRESS_EVERY=25
+      # Time tracking settings
+      - TRAIN_GPU_FAST=1
+    working_dir: /workspace
+    command: ["python", "scripts/train_bilstm.py"]
+    # For Intel Arc GPU access
+    devices:
+      - /dev/dri:/dev/dri
+    # Privileged mode may be needed for some GPU operations
+    privileged: true
+    restart: unless-stopped
+    
+  # Alternative service for quick testing with time tracking
+  time-tracking-test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.xpu
+    image: inertialink-xpu:latest
+    container_name: inertialink-test
+    volumes:
+      - ./scripts:/workspace/scripts
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=UTC
+    working_dir: /workspace
+    command: ["python", "scripts/test_time_tracking.py", "5", "20", "0.1"]
+    profiles:
+      - test
+    restart: "no"
